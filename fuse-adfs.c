@@ -4,6 +4,7 @@
 #include <fuse_lowlevel.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,6 +20,8 @@
 #define DIR_ENT_SIZE   0x1A
 #define DIR_FTR_SIZE   0x35
 #define DIR_MAX_ENT      47
+#define FSMAP_MAX_ENT    82
+#define FSMAP_SIZE    0x200
 
 #define ATTR_UREAD   0x0001
 #define ATTR_UWRITE  0x0002
@@ -31,8 +34,7 @@
 #define ATTR_DIR     0x0100
 #define ATTR_SCANNED 0x1000
 
-struct adfs_inode;
-struct adfs_dirent;
+struct adfs_directory;
 
 struct adfs_inode {
     fuse_ino_t parent;
@@ -41,7 +43,7 @@ struct adfs_inode {
     unsigned   exec_addr;
     unsigned   length;
     unsigned   attr;
-    struct adfs_dirent *children;
+    struct adfs_directory *dir_contents;
 };
 
 static struct adfs_inode *inode_tab;
@@ -52,6 +54,12 @@ unsigned itab_used, itab_alloc;
 struct adfs_dirent {
     fuse_ino_t inode;
     char name[ADFS_MAX_NAME+1];
+};
+
+struct adfs_directory {
+    unsigned num_ent;
+    struct adfs_dirent ents[DIR_MAX_ENT];
+    unsigned char footer[DIR_FTR_SIZE];
 };
 
 static struct options {
@@ -78,6 +86,7 @@ static int (*readsect)(off_t posn, unsigned char *buf, size_t size);
 static int (*writesect)(off_t posn, const unsigned char *buf, size_t size);
 static uid_t uid;
 static gid_t gid;
+static unsigned char fsmap[FSMAP_SIZE];
 
 static int rdsect_simple(off_t posn, unsigned char *buf, size_t size)
 {
@@ -157,7 +166,7 @@ static void make_root(struct adfs_inode *root)
     root->exec_addr = 0;
     root->length = ADFS_DIR_SIZE;
     root->attr = ATTR_UREAD|ATTR_UWRITE|ATTR_DIR;
-    root->children = NULL;
+    root->dir_contents = NULL;
 }
 
 static inline uint32_t adfs_get32(const unsigned char *base)
@@ -175,12 +184,13 @@ static const char bbc_chars[] = "?<;+/#=>";
 
 static int scan_dir(struct adfs_inode *dir, unsigned char *data)
 {
-    struct adfs_dirent *child = malloc(DIR_MAX_ENT * sizeof(struct adfs_dirent));
-    if (!child)
+    struct adfs_directory *contents = malloc(sizeof(struct adfs_directory));
+    if (!contents)
         return errno;
-    dir->children = child;
+    dir->dir_contents = contents;
+    struct adfs_dirent *child = contents->ents;
     unsigned char *ptr = data + DIR_HDR_SIZE;
-    unsigned char *ftr = data + ADFS_DIR_SIZE - DIR_ENT_SIZE;
+    unsigned char *ftr = data + ADFS_DIR_SIZE - DIR_FTR_SIZE;
     while (ptr < ftr) {
         int i;
         for (i = 0; i < ADFS_MAX_NAME; ++i) {
@@ -194,7 +204,7 @@ static int scan_dir(struct adfs_inode *dir, unsigned char *data)
         }
         child->name[i] = 0;
         if (!i)
-            return 0;
+            break;
         if (itab_used >= itab_alloc) {
             size_t newsize = itab_alloc + INODE_CHUNK_SIZE;
             struct adfs_inode *newtab = realloc(inode_tab, newsize * sizeof(struct adfs_inode));
@@ -220,22 +230,112 @@ static int scan_dir(struct adfs_inode *dir, unsigned char *data)
         inode->exec_addr = adfs_get32(ptr + 0x0e);
         inode->length    = adfs_get32(ptr + 0x12);
         inode->sector    = adfs_get24(ptr + 0x16);
-        inode->children = NULL;
+        inode->dir_contents = NULL;
         child->inode = inum;
         child++;
         ptr += DIR_ENT_SIZE;
     }
+    contents->num_ent = child - contents->ents;
+    memcpy(contents->footer, ftr, DIR_FTR_SIZE);
     return 0;
 }
 
 static int read_dir(struct adfs_inode *dir)
 {
-    if (dir->children)
+    if (dir->dir_contents)
         return 0;
     unsigned char buf[ADFS_DIR_SIZE];
     int err = readsect(dir->sector * ADFS_SECT_SIZE, buf, ADFS_DIR_SIZE);
     if (!err)
         err = scan_dir(dir, buf);
+    return err;
+}
+
+static inline void adfs_put32(unsigned char *base, uint32_t value)
+{
+    base[0] = value & 0xff;
+    base[1] = (value >> 8) & 0xff;
+    base[2] = (value >> 16) & 0xff;
+    base[3] = (value >> 24) & 0xff;
+}
+
+static inline void adfs_put24(unsigned char *base, uint32_t value)
+{
+    base[0] = value & 0xff;
+    base[1] = (value >> 8) & 0xff;
+    base[2] = (value >> 16) & 0xff;
+}
+
+static int write_dir(struct adfs_inode *dir)
+{
+    struct adfs_directory *contents = dir->dir_contents;
+    unsigned char buf[ADFS_DIR_SIZE];
+    unsigned new_seq = contents->footer[0x2f] + 1;
+    buf[0] = new_seq;
+    memcpy(buf+1, "Hugo", 4);
+    buf[0x4ff] = new_seq;
+    struct adfs_dirent *child = contents->ents;
+    unsigned num_ent = contents->num_ent;
+    unsigned char *ptr = buf + DIR_HDR_SIZE;
+    unsigned char *ftr = buf + ADFS_DIR_SIZE - DIR_FTR_SIZE;
+    while (num_ent--) {
+        for (int i = 0; i < ADFS_MAX_NAME; ++i) {
+            int ch = child->name[i];
+            if (!ch) {
+                ptr[i] = 0x0d;
+                break;
+            }
+            ptr[i] = ch;
+        }
+        struct adfs_inode *inode = inode_tab + child->inode;
+        unsigned a = inode->attr;
+        if (a & ATTR_UREAD)  ptr[0] |= 0x80;
+        if (a & ATTR_UWRITE) ptr[1] |= 0x80;
+        if (a & ATTR_LOCKED) ptr[2] |= 0x80;
+        if (a & ATTR_DIR)    ptr[3] |= 0x80;
+        if (a & ATTR_UEXEC)  ptr[4] |= 0x80;
+        if (a & ATTR_OREAD)  ptr[5] |= 0x80;
+        if (a & ATTR_OWRITE) ptr[6] |= 0x80;
+        if (a & ATTR_OEXEC)  ptr[7] |= 0x80;
+        if (a & ATTR_PRIV)   ptr[8] |= 0x80;
+        adfs_put24(ptr + 0x0a, inode->load_addr);
+        adfs_put24(ptr + 0x0e, inode->exec_addr);
+        adfs_put24(ptr + 0x12, inode->length);
+        adfs_put24(ptr + 0x16, inode->sector);
+        child++;
+        ptr += DIR_ENT_SIZE;
+    }
+    if (ptr < ftr)
+        *ptr = 0;
+    memcpy(contents->footer, ftr, DIR_FTR_SIZE-1);
+    return writesect(dir->sector, buf, ADFS_DIR_SIZE);
+}
+
+static unsigned checksum(unsigned char *base)
+{
+    int i = 255, c = 0;
+    unsigned sum = 255;
+    while (--i >= 0) {
+        sum += base[i] + c;
+        c = 0;
+        if (sum >= 256) {
+            sum &= 0xff;
+            c = 1;
+        }
+    }
+    return sum;
+}
+
+static int read_fsmap(void)
+{
+    int err = readsect(0, fsmap, FSMAP_SIZE);
+    if (!err) {
+        if (checksum(fsmap) == fsmap[0xff] && checksum(fsmap + 0x100) == fsmap[0x1ff])
+            return 0;
+        fprintf(stderr, "%s: %s has a bad free space map\n", program_invocation_short_name, dev_name);
+        return -1;
+    }
+    fprintf(stderr, "%s: unable to read free space map for %s: %s\n", program_invocation_short_name, dev_name, strerror(err));
     return err;
 }
 
@@ -333,18 +433,17 @@ static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
         if (ent->attr & ATTR_DIR) {
             int err = read_dir(ent);
             if (!err) {
-                ent = inode_tab + parent;
-                struct adfs_dirent *ptr = ent->children;
-                for (int i = 0; i < DIR_MAX_ENT; ++i) {
-                    if (!ptr->name[0])
-                        break;
+                struct adfs_directory *contents = inode_tab[parent].dir_contents;
+                unsigned num_ent = contents->num_ent;
+                struct adfs_dirent *ptr = contents->ents;
+                while (num_ent--) {
                     int d = name_cmp(name, ptr->name);
                     if (!d) {
                         struct fuse_entry_param e;
                         if (!adfs_stat(ptr->inode, &e.attr)) {
                             e.ino = e.attr.st_ino;
-                            e.attr_timeout = 1.0;
-                            e.entry_timeout = 1.0;
+                            e.attr_timeout = ULONG_MAX;
+                            e.entry_timeout = ULONG_MAX;
                             fuse_reply_entry(req, &e);
                         }
                         else
@@ -416,14 +515,14 @@ static void adfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 static void adfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
     if (--ino < itab_used) {
-        struct adfs_dirent *ent = inode_tab[ino].children + off;
+        struct adfs_directory *contents = inode_tab[ino].dir_contents;
+        struct adfs_dirent *ent = contents->ents + off;
+        unsigned num_ent = contents->num_ent - off;
         int err = 0;
         char buf[size];
         char *ptr = buf;
         size_t avail = size;
-        for (int i = DIR_MAX_ENT - off; i; --i) {
-            if (!ent->name[0])
-                break;
+        while (num_ent--) {
             struct stat stb;
             if ((err = adfs_stat(ent->inode, &stb)))
                 break;
@@ -470,9 +569,9 @@ static const struct fuse_lowlevel_ops adfs_ops =
     .lookup  = adfs_lookup,
     .getattr = adfs_getattr,
     .open    = adfs_open,
+    .read    = adfs_read,
     .opendir = adfs_opendir,
-    .readdir = adfs_readdir,
-    .read    = adfs_read
+    .readdir = adfs_readdir
 };
 
 int main(int argc, char *argv[])
@@ -510,15 +609,17 @@ int main(int argc, char *argv[])
                         fl.l_pid = 0;
                         if (!fcntl(dev_fd, F_SETLKW, &fl)) {
                             if (!(ret = adfs_ioselect())) {
-                                uid = getuid();
-                                gid = getgid();
-                                if (!fuse_set_signal_handlers(se)) {
-                                    if (!fuse_session_mount(se, mountpoint)) {
-                                        fuse_daemonize(options.foreground);
-                                        ret = fuse_session_loop(se);
-                                        fuse_session_unmount(se);
+                                if (options.read_only || !read_fsmap()) {
+                                    uid = getuid();
+                                    gid = getgid();
+                                    if (!fuse_set_signal_handlers(se)) {
+                                        if (!fuse_session_mount(se, mountpoint)) {
+                                            fuse_daemonize(options.foreground);
+                                            ret = fuse_session_loop(se);
+                                            fuse_session_unmount(se);
+                                        }
+                                        fuse_remove_signal_handlers(se);
                                     }
-                                    fuse_remove_signal_handlers(se);
                                 }
                             }
                         }
