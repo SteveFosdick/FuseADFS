@@ -379,10 +379,14 @@ static void adfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     if (--ino < itab_used) {
-        if ((fi->flags & O_ACCMODE) != O_RDONLY)
-            fuse_reply_err(req, EACCES);
+        if ((fi->flags & O_ACCMODE) == O_RDONLY) {
+            if (inode_tab[ino].attr & ATTR_UREAD)
+                fuse_reply_open(req, fi);
+            else
+                fuse_reply_err(req, EACCES);
+        }
         else
-            fuse_reply_open(req, fi);
+            fuse_reply_err(req, EROFS);
     }
     else
         fuse_reply_err(req, ENOENT);
@@ -391,15 +395,19 @@ static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 static void adfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     if (--ino < itab_used) {
-        int err = read_dir(inode_tab + ino);
-        if (!err) {
-            struct fuse_file_info fi;
-            memset(&fi, 0, sizeof(fi));
-            fi.cache_readdir = 1;
-            fuse_reply_open(req, &fi);
+        if (inode_tab[ino].attr & ATTR_UREAD) {
+            int err = read_dir(inode_tab + ino);
+            if (!err) {
+                struct fuse_file_info fi;
+                memset(&fi, 0, sizeof(fi));
+                fi.cache_readdir = 1;
+                fuse_reply_open(req, &fi);
+            }
+            else
+                fuse_reply_err(req, err);
         }
         else
-            fuse_reply_err(req, err);
+            fuse_reply_err(req, EACCES);
     }
     else
         fuse_reply_err(req, ENOENT);
