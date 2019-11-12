@@ -328,7 +328,6 @@ static int name_cmp(const char *pattern, const char *candidate)
 
 static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
-    printf("lookup %ld:%s\n", parent, name);
     if (--parent < itab_used && strlen(name) <= ADFS_MAX_NAME) {
         struct adfs_inode *ent = inode_tab + parent;
         if (ent->attr & ATTR_DIR) {
@@ -340,11 +339,9 @@ static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
                     if (!ptr->name[0])
                         break;
                     int d = name_cmp(name, ptr->name);
-                    printf("%s<>%s->%d\n", name, ptr->name, d);
                     if (!d) {
                         struct fuse_entry_param e;
                         if (!adfs_stat(ptr->inode, &e.attr)) {
-                            printf("adfs_lookup: %s->%ld\n", name, e.attr.st_ino);
                             e.ino = e.attr.st_ino;
                             e.attr_timeout = 1.0;
                             e.entry_timeout = 1.0;
@@ -372,20 +369,15 @@ static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 
 static void adfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    printf("getattr %ld\n", ino);
     struct stat stbuf;
-    if (!adfs_stat(--ino, &stbuf)) {
-        fputs("found\n", stdout);
+    if (!adfs_stat(--ino, &stbuf))
         fuse_reply_attr(req, &stbuf, 1.0);
-    }
     else
         fuse_reply_err(req, ENOENT);
 }
 
 static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    printf("open %ld\n", ino);
-
     if (--ino < itab_used) {
         if ((fi->flags & O_ACCMODE) != O_RDONLY)
             fuse_reply_err(req, EACCES);
@@ -398,8 +390,6 @@ static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 
 static void adfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    printf("opendir %ld\n", ino);
-
     if (--ino < itab_used) {
         int err = read_dir(inode_tab + ino);
         if (!err) {
@@ -417,8 +407,6 @@ static void adfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 
 static void adfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
-    printf("readdir %ld %ld %ld\n", ino, size, off);
-
     if (--ino < itab_used) {
         struct adfs_dirent *ent = inode_tab[ino].children + off;
         int err = 0;
@@ -449,8 +437,6 @@ static void adfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
 static void adfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
-    printf("read %ld: %ld,%ld\n", ino, size, off);
-
     if (--ino < itab_used) {
         struct adfs_inode *ent = inode_tab + ino;
         off_t left = ent->length - off;
