@@ -411,15 +411,11 @@ static int adfs_stat(fuse_ino_t ino, struct stat *stp)
 static int name_cmp(const char *pattern, const char *candidate)
 {
     for (int c = ADFS_MAX_NAME; c; c--) {
-        int pat_ch = *pattern++ & 0x7f;
-        int can_ch = *candidate++ & 0x7f;
+        int pat_ch = *pattern++;
+        int can_ch = *candidate++;
         if (!pat_ch)
             return (!can_ch || can_ch == 0x0d) ? 0 : 1;
-        if (pat_ch > ' ')
-            pat_ch |= 0x20;
-        if (can_ch > ' ')
-            can_ch |= 0x20;
-        int d = pat_ch - can_ch;
+        int d = (pat_ch & 0x5f) - (can_ch & 0x5f);
         if (d)
             return d;
     }
