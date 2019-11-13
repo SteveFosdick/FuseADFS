@@ -93,14 +93,14 @@ static unsigned char fsmap[FSMAP_SIZE];
 static int fsmap_dirty;
 
 #ifdef DEBUG
-#define debug(fmt, ...) fuse_log(FUSE_LOG_DEBUG, fmt, __VA_ARGS__)
+#define debug(...) fuse_log(FUSE_LOG_DEBUG, __VA_ARGS__)
 #else
-#define debug(fmt, ...)
+#define debug(...)
 #endif
 
 static int rdsect_simple(off_t posn, unsigned char *buf, size_t size)
 {
-    debug("rdsect_simple posn=%ld, buf=%p, size=%ld", posn, buf, size);
+    debug("rdsect_simple posn=%ld, buf=%p, size=%ld\n", posn, buf, size);
     if (!size)
         return 0;
     if (lseek(dev_fd, posn, SEEK_SET) < 0)
@@ -357,7 +357,7 @@ static int insert_name(struct adfs_inode *dir, const char *name, fuse_ino_t ino)
         return ENOSPC;
     struct adfs_dirent *child = contents->ents;
     while (num_ent--) {
-        printf("insert_name: comparing %s <> %s\n", name, child->name);
+        debug("insert_name: comparing %s <> %s\n", name, child->name);
         int d = name_cmp(name, child->name);
         if (!d)
             return EEXIST;
@@ -367,7 +367,7 @@ static int insert_name(struct adfs_inode *dir, const char *name, fuse_ino_t ino)
     }
     if (++num_ent > 0) {
         size_t bytes = num_ent * sizeof(struct adfs_dirent);
-        printf("num_ent=%d, next=%s, moving %ld bytes\n", num_ent, child->name, bytes);
+        debug("num_ent=%d, next=%s, moving %ld bytes\n", num_ent, child->name, bytes);
         memmove(child + 1, child, bytes);
     }
     strncpy(child->name, name, ADFS_MAX_NAME);
@@ -398,10 +398,10 @@ static int read_fsmap(void)
     if (!err) {
         if (checksum(fsmap) == fsmap[0xff] && checksum(fsmap + 0x100) == fsmap[0x1ff])
             return 0;
-        fprintf(stderr, "%s: %s has a bad free space map\n", program_invocation_short_name, dev_name);
+        fuse_log(FUSE_LOG_ERR, "%s: %s has a bad free space map\n", program_invocation_short_name, dev_name);
         return -1;
     }
-    fprintf(stderr, "%s: unable to read free space map for %s: %s\n", program_invocation_short_name, dev_name, strerror(err));
+    fuse_log(FUSE_LOG_ERR, "%s: unable to read free space map for %s: %s\n", program_invocation_short_name, dev_name, strerror(err));
     return err;
 }
 
@@ -415,18 +415,18 @@ static int write_fsmap(void)
 static int extend_inplace(unsigned ssect, unsigned avail, size_t end)
 {
     unsigned end_sect = ssect + (avail / ADFS_SECT_SIZE);
-    printf("extend_inplace: end_sect=%d\n", end_sect);
+    debug("extend_inplace: end_sect=%d\n", end_sect);
     int num_ent = fsmap[0x1fe];
     for (int ent = 0; ent < num_ent; ent += 3) {
         unsigned sector = adfs_get24(fsmap + ent);
-        printf("extend_inplace: entry, sector=%d\n", sector);
+        debug("extend_inplace: entry, sector=%d\n", sector);
         if (sector == end_sect) {
-            printf("extend_inplace: found entry at %d\n", ent);
+            debug("extend_inplace: found entry at %d\n", ent);
             unsigned reqd = end - avail;
             unsigned size = adfs_get24(fsmap + 0x100 + ent);
             if (size >= reqd) {
                 if (size == reqd) {
-                    fputs("extend_inplace: exact match\n", stdout);
+                    debug("extend_inplace: exact match\n");
                     /* exact match so remove entry */
                     size_t bytes = (num_ent - ent) * 3;
                     memmove(fsmap + ent, fsmap + ent + 3, bytes);
@@ -434,7 +434,7 @@ static int extend_inplace(unsigned ssect, unsigned avail, size_t end)
                     fsmap[0x1fe]--;
                 }
                 else {
-                    fputs("extend_inplace: adjusting entry\n", stdout);
+                    debug("extend_inplace: adjusting entry\n");
                     adfs_put24(fsmap + ent, sector + reqd);
                     adfs_put24(fsmap + 0x100 + ent, size - reqd);
                 }
@@ -512,7 +512,7 @@ static int move_file(struct adfs_inode *inode, unsigned dsect, size_t bytes)
     unsigned char buf[4096];
     int err;
 
-    printf("moving file from %d (sector %d) to %d (sector %d), size=%ld\n", src, inode->sector, dest, dsect, bytes);
+    debug("moving file from %d (sector %d) to %d (sector %d), size=%ld\n", src, inode->sector, dest, dsect, bytes);
 
     while (bytes >= sizeof(buf)) {
         if ((err = readsect(src, buf, sizeof(buf))))
@@ -555,26 +555,25 @@ static int adfs_ioselect(void)
                 } while (--size);
                 return scan_dir(inode_tab, buf);
             }
-            fprintf(stderr, "%s: %s does not contain an ADFS filesystem\n", program_invocation_short_name, dev_name);
+            fuse_log(FUSE_LOG_ERR, "%s: %s does not contain an ADFS filesystem\n", program_invocation_short_name, dev_name);
         }
         else
-            fprintf(stderr, "%s: unable to read %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
+            fuse_log(FUSE_LOG_ERR, "%s: unable to read %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
     }
     else
-        fprintf(stderr, "%s: unable to seek %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
+        fuse_log(FUSE_LOG_ERR, "%s: unable to seek %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
     return 1;
 }
 
 static void write_dirty(void)
 {
-    fuse_log(FUSE_LOG_DEBUG, "write_dirty\n");
     struct adfs_inode *inode = inode_tab;
     struct adfs_inode *end = inode + itab_used;
     while (inode < end) {
         struct adfs_directory *dir = inode->dir_contents;
-        fuse_log(FUSE_LOG_DEBUG, "checking inode %p, dir=%p\n", inode, dir);
+        debug("write_dirty: checking inode %p, dir=%p\n", inode, dir);
         if (dir && dir->dirty) {
-            fuse_log(FUSE_LOG_DEBUG, "dirty, writing dir\n");
+            debug("dirty, writing dir\n");
             int err = write_dir(inode);
             if (err)
                 fuse_log(FUSE_LOG_ERR, "%s: %s: unable to write directory back to filesystem: %s\n", program_invocation_short_name, dev_name, strerror(err));
@@ -908,13 +907,13 @@ static void adfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t s
         if (!(inode->attr & ATTR_DELETED)) {
             size_t end = off + size;
             size_t avail = (inode->length + 255) & ~0xff;
-            printf("adfs_write: end=%ld, avail=%ld\n", end, avail);
+            debug("adfs_write: end=%ld, avail=%ld\n", end, avail);
             if (end > avail) {
-                fputs("adfs_write: need more space\n", stdout);
+                debug("adfs_write: need more space\n");
                 if (avail == 0 || extend_inplace(inode->sector, avail, end)) {
-                    fputs("adfs_write: can't extend in place\n", stdout);
+                    debug("adfs_write: can't extend in place\n");
                     unsigned sector = alloc_space(end);
-                    printf("adfs_write: new start sector %d\n", sector);
+                    debug("adfs_write: new start sector %d\n", sector);
                     if (!sector) {
                         fuse_reply_err(req, ENOSPC);
                         return;
@@ -1032,14 +1031,14 @@ int main(int argc, char *argv[])
                             }
                         }
                         else
-                            fprintf(stderr, "%s: unable to lock %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
+                            fuse_log(FUSE_LOG_ERR, "%s: unable to lock %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
                     }
                     else
-                        fprintf(stderr, "%s: unable to allocate inode table: %s\n", program_invocation_short_name, strerror(errno));
+                        fuse_log(FUSE_LOG_ERR, "%s: unable to allocate inode table: %s\n", program_invocation_short_name, strerror(errno));
                     close(dev_fd);
                 }
                 else
-                    fprintf(stderr, "%s: unable to open %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
+                    fuse_log(FUSE_LOG_ERR, "%s: unable to open %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
                 fuse_session_destroy(se);
             }
         }
