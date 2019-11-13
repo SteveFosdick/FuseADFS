@@ -90,10 +90,17 @@ static int (*writesect)(off_t posn, const unsigned char *buf, size_t size);
 static uid_t uid;
 static gid_t gid;
 static unsigned char fsmap[FSMAP_SIZE];
-static int map_dirty;
+static int fsmap_dirty;
+
+#ifdef DEBUG
+#define debug(fmt, ...) fuse_log(FUSE_LOG_DEBUG, fmt, __VA_ARGS__)
+#else
+#define debug(fmt, ...)
+#endif
 
 static int rdsect_simple(off_t posn, unsigned char *buf, size_t size)
 {
+    debug("rdsect_simple posn=%ld, buf=%p, size=%ld", posn, buf, size);
     if (!size)
         return 0;
     if (lseek(dev_fd, posn, SEEK_SET) < 0)
@@ -290,40 +297,40 @@ static int write_dir(struct adfs_inode *dir)
     memcpy(buf, contents->footer + 0x2f, 5);
     struct adfs_dirent *child = contents->ents;
     unsigned num_ent = contents->num_ent;
-    unsigned char *ptr = buf + DIR_HDR_SIZE;
+    unsigned char *ent = buf + DIR_HDR_SIZE;
     unsigned char *ftr = buf + ADFS_DIR_SIZE - DIR_FTR_SIZE;
     while (num_ent--) {
         for (int i = 0; i < ADFS_MAX_NAME; ++i) {
             int ch = child->name[i];
             if (!ch) {
-                ptr[i] = 0x0d;
+                ent[i] = 0x0d;
                 break;
             }
             char *ptr = strchr(hst_chars, ch);
             if (ptr)
                 ch = bbc_chars[ptr-hst_chars];
-            ptr[i] = ch;
+            ent[i] = ch;
         }
         struct adfs_inode *inode = inode_tab + child->inode;
         unsigned a = inode->attr;
-        if (a & ATTR_UREAD)  ptr[0] |= 0x80;
-        if (a & ATTR_UWRITE) ptr[1] |= 0x80;
-        if (a & ATTR_LOCKED) ptr[2] |= 0x80;
-        if (a & ATTR_DIR)    ptr[3] |= 0x80;
-        if (a & ATTR_UEXEC)  ptr[4] |= 0x80;
-        if (a & ATTR_OREAD)  ptr[5] |= 0x80;
-        if (a & ATTR_OWRITE) ptr[6] |= 0x80;
-        if (a & ATTR_OEXEC)  ptr[7] |= 0x80;
-        if (a & ATTR_PRIV)   ptr[8] |= 0x80;
-        adfs_put32(ptr + 0x0a, inode->load_addr);
-        adfs_put32(ptr + 0x0e, inode->exec_addr);
-        adfs_put32(ptr + 0x12, inode->length);
-        adfs_put24(ptr + 0x16, inode->sector);
+        if (a & ATTR_UREAD)  ent[0] |= 0x80;
+        if (a & ATTR_UWRITE) ent[1] |= 0x80;
+        if (a & ATTR_LOCKED) ent[2] |= 0x80;
+        if (a & ATTR_DIR)    ent[3] |= 0x80;
+        if (a & ATTR_UEXEC)  ent[4] |= 0x80;
+        if (a & ATTR_OREAD)  ent[5] |= 0x80;
+        if (a & ATTR_OWRITE) ent[6] |= 0x80;
+        if (a & ATTR_OEXEC)  ent[7] |= 0x80;
+        if (a & ATTR_PRIV)   ent[8] |= 0x80;
+        adfs_put32(ent + 0x0a, inode->load_addr);
+        adfs_put32(ent + 0x0e, inode->exec_addr);
+        adfs_put32(ent + 0x12, inode->length);
+        adfs_put24(ent + 0x16, inode->sector);
         child++;
-        ptr += DIR_ENT_SIZE;
+        ent += DIR_ENT_SIZE;
     }
-    if (ptr < ftr)
-        *ptr = 0;
+    if (ent < ftr)
+        *ent = 0;
     memcpy(ftr, contents->footer, DIR_FTR_SIZE);
     return writesect(dir->sector * ADFS_SECT_SIZE, buf, ADFS_DIR_SIZE);
 }
@@ -342,21 +349,10 @@ static int name_cmp(const char *pattern, const char *candidate)
     return 0;
 }
 
-static void print_dir(const char *when, struct adfs_directory *contents)
-{
-    unsigned num_ent = contents->num_ent;
-    struct adfs_dirent *child = contents->ents;
-    while (num_ent--) {
-        printf("%s: %ld %s\n", when, child->inode, child->name);
-        child++;
-    }
-}
-
 static int insert_name(struct adfs_inode *dir, const char *name, fuse_ino_t ino)
 {
     struct adfs_directory *contents = dir->dir_contents;
-    print_dir("before", contents);
-    unsigned num_ent = contents->num_ent;
+    int num_ent = contents->num_ent;
     if (num_ent == DIR_MAX_ENT)
         return ENOSPC;
     struct adfs_dirent *child = contents->ents;
@@ -369,15 +365,15 @@ static int insert_name(struct adfs_inode *dir, const char *name, fuse_ino_t ino)
             break;
         child++;
     }
-    if (num_ent) {
-        size_t bytes = (num_ent + 1) * sizeof(struct adfs_dirent);
+    if (++num_ent > 0) {
+        size_t bytes = num_ent * sizeof(struct adfs_dirent);
         printf("num_ent=%d, next=%s, moving %ld bytes\n", num_ent, child->name, bytes);
         memmove(child + 1, child, bytes);
     }
     strncpy(child->name, name, ADFS_MAX_NAME);
     child->inode = ino;
     contents->num_ent++;
-    print_dir("after", contents);
+    contents->dirty++;
     return 0;
 }
 
@@ -413,10 +409,7 @@ static int write_fsmap(void)
 {
     fsmap[0x0ff] = checksum(fsmap);
     fsmap[0x1ff] = checksum(fsmap + 0x100);
-    int err = writesect(0, fsmap, FSMAP_SIZE);
-    if (!err)
-        map_dirty = 0;
-    return err;
+    return writesect(0, fsmap, FSMAP_SIZE);
 }
 
 static int extend_inplace(unsigned ssect, unsigned avail, size_t end)
@@ -445,7 +438,7 @@ static int extend_inplace(unsigned ssect, unsigned avail, size_t end)
                     adfs_put24(fsmap + ent, sector + reqd);
                     adfs_put24(fsmap + 0x100 + ent, size - reqd);
                 }
-                map_dirty++;
+                fsmap_dirty++;
                 return 0;
             }
             else
@@ -474,7 +467,7 @@ static int alloc_space(size_t bytes)
                 adfs_put24(fsmap + ent, sector + reqd);
                 adfs_put24(fsmap + 0x100 + ent, size - reqd);
             }
-            map_dirty++;
+            fsmap_dirty++;
             return sector;
         }
     }
@@ -492,7 +485,7 @@ static int free_space(unsigned sector, size_t length)
         if ((posn + size) == sector) { // coallesce
             size += sects;
             adfs_put24(fsmap + 0x100 + ent, size);
-            map_dirty++;
+            fsmap_dirty++;
             return 0;
         }
         if (posn > sector) {
@@ -572,6 +565,31 @@ static int adfs_ioselect(void)
     return 1;
 }
 
+static void write_dirty(void)
+{
+    fuse_log(FUSE_LOG_DEBUG, "write_dirty\n");
+    struct adfs_inode *inode = inode_tab;
+    struct adfs_inode *end = inode + itab_used;
+    while (inode < end) {
+        struct adfs_directory *dir = inode->dir_contents;
+        fuse_log(FUSE_LOG_DEBUG, "checking inode %p, dir=%p\n", inode, dir);
+        if (dir && dir->dirty) {
+            fuse_log(FUSE_LOG_DEBUG, "dirty, writing dir\n");
+            int err = write_dir(inode);
+            if (err)
+                fuse_log(FUSE_LOG_ERR, "%s: %s: unable to write directory back to filesystem: %s\n", program_invocation_short_name, dev_name, strerror(err));
+        }
+        ++inode;
+    }
+    if (fsmap_dirty) {
+        fuse_log(FUSE_LOG_DEBUG, "writing fsmap");
+        int err = write_fsmap();
+        if (err)
+            fuse_log(FUSE_LOG_ERR, "%s: %s: unable to write free space map back to filesystem: %s\n", program_invocation_short_name, dev_name, strerror(err));
+    }
+    fuse_log(FUSE_LOG_DEBUG, "done");
+}
+
 static void fill_stat(fuse_ino_t ino, struct adfs_inode *inode, struct stat *stp)
 {
     mode_t mode;
@@ -617,6 +635,7 @@ static void stat_reply(fuse_req_t req, fuse_ino_t ino, struct adfs_inode *inode)
 
 static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
+    debug("lookup %ld %s\n", parent, name);
     int err = ENOENT;
     if (--parent < itab_used && strlen(name) <= ADFS_MAX_NAME) {
         struct adfs_inode *inode = inode_tab + parent;
@@ -648,7 +667,7 @@ static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 
 static void adfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
 {
-    printf("forget %ld\n", ino);
+    debug("forget %ld\n", ino);
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
         if (--inode->use_count == 0)
@@ -661,10 +680,11 @@ static void adfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
 
 static void adfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+    debug("getattr %ld\n", ino);
     if (ino <= itab_used) {
         struct adfs_inode *inode = inode_tab + ino - 1;
         if (!(inode->attr & ATTR_DELETED)) {
-    struct stat stbuf;
+            struct stat stbuf;
             memset(&stbuf, 0, sizeof(stbuf));
             fill_stat(ino, inode, &stbuf);
             fuse_reply_attr(req, &stbuf, ULONG_MAX);
@@ -677,16 +697,16 @@ static void adfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 static unsigned mode2attr(mode_t mode)
 {
     unsigned attr = 0;
-    if (mode & S_IRUSR) attr = ATTR_UREAD;
-    if (mode & S_IWUSR) attr = ATTR_UWRITE;
-    if (mode & (S_IRGRP|S_IROTH)) attr = ATTR_OREAD;
-    if (mode & (S_IWGRP|S_IWOTH)) attr = ATTR_OWRITE;
+    if (mode & S_IRUSR) attr |= ATTR_UREAD;
+    if (mode & S_IWUSR) attr |= ATTR_UWRITE;
+    if (mode & (S_IRGRP|S_IROTH)) attr |= ATTR_OREAD;
+    if (mode & (S_IWGRP|S_IWOTH)) attr |= ATTR_OWRITE;
     return attr;
 }
 
 static void adfs_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev)
 {
-    printf("mknod %ld %s\n", parent, name);
+    debug("mknod %ld %s\n", parent, name);
     int err = ENOENT;
     if (--parent < itab_used) {
         struct adfs_inode *pnode = inode_tab + parent;
@@ -710,10 +730,54 @@ static void adfs_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode
     fuse_reply_err(req, err);
 }
 
+static void adfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode)
+{
+    debug("mknod %ld %s %o\n", parent, name, mode);
+    int err = ENOENT;
+    if (--parent < itab_used) {
+        struct adfs_inode *pnode = inode_tab + parent;
+        if (!(pnode->attr & ATTR_DELETED)) {
+            size_t name_len = strlen(name);
+            if (name_len <= ADFS_MAX_NAME) {
+                struct adfs_directory *contents = malloc(sizeof(struct adfs_directory));
+                if (contents) {
+                    unsigned sector = alloc_space(ADFS_DIR_SIZE);
+                    if (sector) {
+                        int inum = new_inode(parent, sector, ADFS_DIR_SIZE, mode2attr(mode)|ATTR_DIR, 0, 0);
+                        if (inum >= 0) {
+                            err = insert_name(pnode, name, inum);
+                            if (!err) {
+                                contents->num_ent = 0;
+                                contents->dirty = 1;
+                                memset(contents->footer, 0, DIR_FTR_SIZE);
+                                memcpy(contents->footer+1, name, name_len);   // directory name.
+                                memcpy(contents->footer+0xe, name, name_len); // directory title.
+                                adfs_put24(contents->footer+0xb, pnode->sector);
+                                memcpy(contents->footer+0x30, "Hugo", 4);
+                                inode_tab[inum].dir_contents = contents;
+                                stat_reply(req, inum+1, inode_tab + inum);
+                                return;
+                            }
+                        }
+                        else
+                            err = -inum;
+                    }
+                    else
+                        err = ENOSPC;
+                }
+                else
+                    err = ENOMEM;
+            }
+            else
+                err = ENAMETOOLONG;
+        }
+    }
+    fuse_reply_err(req, err);
+}
+
 static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
-    printf("open: %ld\n", ino);
-
+    debug("open: %ld\n", ino);
     int err = ENOENT;
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
@@ -738,7 +802,7 @@ static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
                         return;
                     }
                     inode->length = 0;
-                    inode_tab[inode->parent].dir_contents->dirty = 1;
+                    inode_tab[inode->parent].dir_contents->dirty++;
                 }
                 fuse_reply_open(req, fi);
                 return;
@@ -752,6 +816,7 @@ static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 
 static void adfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+    debug("opendir %ld\n", ino);
     int err = ENOENT;
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
@@ -775,6 +840,7 @@ static void adfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 
 static void adfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
+    debug("readdir %ld size=%ld off=%ld\n", ino, size, off);
     int err = ENOENT;
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
@@ -808,6 +874,7 @@ static void adfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
 
 static void adfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
+    debug("read %ld size=%ld off=%ld\n", ino, size, off);
     int err = ENOENT;
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
@@ -834,8 +901,7 @@ static void adfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, st
 
 static void adfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off, struct fuse_file_info *fi)
 {
-    printf("adfs_write: ino=%ld, size=%ld,off=%ld\n", ino, size, off);
-
+    debug("write: %ld size=%ld off=%ld\n", ino, size, off);
     int err = ENOENT;
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
@@ -879,15 +945,18 @@ static void adfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t s
 
 static void adfs_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+    debug("flush %ld\n", ino);
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
         if (!(inode->attr & ATTR_DELETED)) {
             struct adfs_inode *parent = inode_tab + inode->parent;
             int err1 = 0, err2 = 0;
             if (parent->dir_contents->dirty)
-                err1 = write_dir(parent);
-            if (map_dirty)
-                err2 = write_fsmap();
+                if (!(err1 = write_dir(parent)))
+                    parent->dir_contents->dirty = 0;
+            if (fsmap_dirty)
+                if (!(err2 = write_fsmap()))
+                    fsmap_dirty = 0;
             if (!err1)
                 err1 = err2;
             fuse_reply_err(req, err1);
@@ -903,6 +972,7 @@ static const struct fuse_lowlevel_ops adfs_ops =
     .forget  = adfs_forget,
     .getattr = adfs_getattr,
     .mknod   = adfs_mknod,
+    .mkdir   = adfs_mkdir,
     .open    = adfs_open,
     .read    = adfs_read,
     .write   = adfs_write,
@@ -954,6 +1024,7 @@ int main(int argc, char *argv[])
                                             fuse_daemonize(options.foreground);
                                             ret = fuse_session_loop(se);
                                             fuse_session_unmount(se);
+                                            write_dirty();
                                         }
                                         fuse_remove_signal_handlers(se);
                                     }
