@@ -60,6 +60,7 @@ struct adfs_directory {
     unsigned num_ent;
     struct adfs_dirent ents[DIR_MAX_ENT];
     unsigned char footer[DIR_FTR_SIZE];
+    char dirty;
 };
 
 static struct options {
@@ -87,6 +88,7 @@ static int (*writesect)(off_t posn, const unsigned char *buf, size_t size);
 static uid_t uid;
 static gid_t gid;
 static unsigned char fsmap[FSMAP_SIZE];
+static int map_dirty;
 
 static int rdsect_simple(off_t posn, unsigned char *buf, size_t size)
 {
@@ -237,6 +239,7 @@ static int scan_dir(struct adfs_inode *dir, unsigned char *data)
     }
     contents->num_ent = child - contents->ents;
     memcpy(contents->footer, ftr, DIR_FTR_SIZE);
+    contents->dirty = 0;
     return 0;
 }
 
@@ -336,6 +339,137 @@ static int read_fsmap(void)
         return -1;
     }
     fprintf(stderr, "%s: unable to read free space map for %s: %s\n", program_invocation_short_name, dev_name, strerror(err));
+    return err;
+}
+
+static int write_fsmap(void)
+{
+    fsmap[0x0ff] = checksum(fsmap);
+    fsmap[0x1ff] = checksum(fsmap + 0x100);
+    int err = writesect(0, fsmap, FSMAP_SIZE);
+    if (!err)
+        map_dirty = 0;
+    return err;
+}
+
+static int extend_inplace(unsigned ssect, unsigned avail, size_t end)
+{
+    unsigned end_sect = ssect + (avail / ADFS_SECT_SIZE);
+    printf("extend_inplace: end_sect=%d\n", end_sect);
+    int num_ent = fsmap[0x1fe];
+    for (int ent = 0; ent < num_ent; ent += 3) {
+        unsigned sector = adfs_get24(fsmap + ent);
+        printf("extend_inplace: entry, sector=%d\n", sector);
+        if (sector == end_sect) {
+            printf("extend_inplace: found entry at %d\n", ent);
+            unsigned reqd = end - avail;
+            unsigned size = adfs_get24(fsmap + 0x100 + ent);
+            if (size >= reqd) {
+                if (size == reqd) {
+                    fputs("extend_inplace: exact match\n", stdout);
+                    /* exact match so remove entry */
+                    size_t bytes = (num_ent - ent) * 3;
+                    memmove(fsmap + ent, fsmap + ent + 3, bytes);
+                    memmove(fsmap + 0x100 + ent, fsmap + 0x100 + ent + 3, bytes);
+                    fsmap[0x1fe]--;
+                }
+                else {
+                    fputs("extend_inplace: adjusting entry\n", stdout);
+                    adfs_put24(fsmap + ent, sector + reqd);
+                    adfs_put24(fsmap + 0x100 + ent, size - reqd);
+                }
+                map_dirty++;
+                return 0;
+            }
+            else
+                return 1; /* space too small */
+        }
+    }
+    return 1;
+}
+
+static int alloc_space(size_t bytes)
+{
+    size_t reqd = (bytes + 255) >> 8;
+    int num_ent = fsmap[0x1fe];
+    for (int ent = 0; ent < num_ent; ent += 3) {
+        size_t size = adfs_get24(fsmap + 0x100 + ent);
+        if (size >= reqd) {
+            unsigned sector = adfs_get24(fsmap + ent);
+            if (size == reqd) {
+                /* exact match so remove entry */
+                size_t bytes = (num_ent - ent) * 3;
+                memmove(fsmap + ent, fsmap + ent + 3, bytes);
+                memmove(fsmap + 0x100 + ent, fsmap + 0x100 + ent + 3, bytes);
+                fsmap[0x1fe]--;
+            }
+            else {
+                adfs_put24(fsmap + ent, sector + reqd);
+                adfs_put24(fsmap + 0x100 + ent, size - reqd);
+            }
+            map_dirty++;
+            return sector;
+        }
+    }
+    return 0;
+}
+
+static int free_space(unsigned sector, size_t length)
+{
+    size_t sects = (length + 255) >> 8;
+    int num_ent = fsmap[0x1fe];
+    int ent;
+    for (ent = 0; ent < num_ent; ent += 3) {
+        unsigned posn = adfs_get24(fsmap + ent);
+        unsigned size = adfs_get24(fsmap + 0x100 + ent);
+        if ((posn + size) == sector) { // coallesce
+            size += sects;
+            adfs_put24(fsmap + 0x100 + ent, size);
+            map_dirty++;
+            return 0;
+        }
+        if (posn > sector) {
+            if (num_ent >= FSMAP_MAX_ENT)
+                return ENOSPC;
+            size_t bytes = (num_ent - ent) * 3;
+            memmove(fsmap + ent + 3, fsmap + ent, bytes);
+            memmove(fsmap + 0x100 + ent + 3, fsmap + 0x100 + ent, bytes);
+            break;
+        }
+    }
+    if (num_ent >= FSMAP_MAX_ENT)
+        return ENOSPC;
+    adfs_put24(fsmap + ent, sector);
+    adfs_put24(fsmap + 0x100 + ent, sects);
+    fsmap[0x1fe]++;
+    return 0;
+}
+
+static int move_file(struct adfs_inode *inode, unsigned dsect, size_t bytes)
+{
+    unsigned src = inode->sector * ADFS_SECT_SIZE;
+    unsigned dest = dsect  * ADFS_SECT_SIZE;
+    unsigned char buf[4096];
+    int err;
+
+    printf("moving file from %d (sector %d) to %d (sector %d), size=%ld\n", src, inode->sector, dest, dsect, bytes);
+
+    while (bytes >= sizeof(buf)) {
+        if ((err = readsect(src, buf, sizeof(buf))))
+            return err;
+        src += sizeof(buf);
+        if ((err = writesect(dest, buf, sizeof(buf))))
+            return err;
+        dest += sizeof(buf);
+    }
+    if (bytes) {
+        if ((err = readsect(src, buf, bytes)))
+            return err;
+        if ((err = writesect(dest, buf, bytes)))
+            return err;
+    }
+    err = free_space(inode->sector, bytes);
+    inode->sector = dsect;
     return err;
 }
 
@@ -473,15 +607,36 @@ static void adfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
 
 static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+    printf("open: %ld\n", ino);
+
     if (--ino < itab_used) {
-        if ((fi->flags & O_ACCMODE) == O_RDONLY) {
-            if (inode_tab[ino].attr & ATTR_UREAD)
-                fuse_reply_open(req, fi);
-            else
-                fuse_reply_err(req, EACCES);
+        mode_t accmode = fi->flags & O_ACCMODE;
+        unsigned mask;
+        if (accmode == O_RDONLY)
+            mask = ATTR_UREAD;
+        else if (options.read_only) {
+            fuse_reply_err(req, EROFS);
+            return;
+        }
+        else if (accmode == O_WRONLY)
+            mask = ATTR_UWRITE;
+        else
+            mask = ATTR_UREAD|ATTR_UWRITE;
+        if ((inode_tab[ino].attr & mask) == mask) {
+            if (fi->flags & O_TRUNC) {
+                struct adfs_inode *inode = inode_tab + ino;
+                int err = free_space(inode->sector, inode->length);
+                if (err) {
+                    fuse_reply_err(req, err);
+                    return;
+                }
+                inode->length = 0;
+                inode_tab[inode->parent].dir_contents->dirty = 1;
+            }
+            fuse_reply_open(req, fi);
         }
         else
-            fuse_reply_err(req, EROFS);
+            fuse_reply_err(req, EACCES);
     }
     else
         fuse_reply_err(req, ENOENT);
@@ -560,12 +715,72 @@ static void adfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, st
         fuse_reply_err(req, ENOENT);
 }
 
+static void adfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off, struct fuse_file_info *fi)
+{
+    printf("adfs_write: ino=%ld, size=%ld,off=%ld\n", ino, size, off);
+
+    if (--ino < itab_used) {
+        struct adfs_inode *inode = inode_tab + ino;
+        size_t end = off + size;
+        size_t avail = (inode->length + 255) & ~0xff;
+        printf("adfs_write: end=%ld, avail=%ld\n", end, avail);
+        if (end > avail) {
+            fputs("adfs_write: need more space\n", stdout);
+            if (avail == 0 || extend_inplace(inode->sector, avail, end)) {
+                fputs("adfs_write: can't extend in place\n", stdout);
+                unsigned sector = alloc_space(end);
+                printf("adfs_write: new start sector %d\n", sector);
+                if (!sector) {
+                    fuse_reply_err(req, ENOSPC);
+                    return;
+                }
+                if (avail) {
+                    int err = move_file(inode, sector, avail);
+                    if (err) {
+                        fuse_reply_err(req, err);
+                        return;
+                    }
+                }
+            }
+        }
+        int err = writesect(inode->sector * ADFS_SECT_SIZE + off, (unsigned char *)buf, size);
+        if (!err) {
+            if (end > inode->length)
+                inode->length = end;
+            fuse_reply_write(req, size);
+        }
+        else
+            fuse_reply_err(req, err);
+    }
+    else
+        fuse_reply_err(req, ENOENT);
+}
+
+static void adfs_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
+{
+    if (--ino < itab_used) {
+        struct adfs_inode *parent = inode_tab + inode_tab[ino].parent;
+        int err1 = 0, err2 = 0;
+        if (parent->dir_contents->dirty)
+            err1 = write_dir(parent);
+        if (map_dirty)
+            err2 = write_fsmap();
+        if (!err1)
+            err1 = err2;
+        fuse_reply_err(req, err1);
+    }
+    else
+        fuse_reply_err(req, ENOENT);
+}
+
 static const struct fuse_lowlevel_ops adfs_ops =
 {
     .lookup  = adfs_lookup,
     .getattr = adfs_getattr,
     .open    = adfs_open,
     .read    = adfs_read,
+    .write   = adfs_write,
+    .flush   = adfs_flush,
     .opendir = adfs_opendir,
     .readdir = adfs_readdir
 };
