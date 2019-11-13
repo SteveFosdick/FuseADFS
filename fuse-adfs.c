@@ -191,6 +191,7 @@ static int scan_dir(struct adfs_inode *dir, unsigned char *data)
     struct adfs_directory *contents = malloc(sizeof(struct adfs_directory));
     if (!contents)
         return errno;
+    fuse_ino_t dir_ino = dir - inode_tab;
     dir->dir_contents = contents;
     struct adfs_dirent *child = contents->ents;
     unsigned char *ptr = data + DIR_HDR_SIZE;
@@ -234,6 +235,7 @@ static int scan_dir(struct adfs_inode *dir, unsigned char *data)
         inode->exec_addr = adfs_get32(ptr + 0x0e);
         inode->length    = adfs_get32(ptr + 0x12);
         inode->sector    = adfs_get24(ptr + 0x16);
+        inode->parent    = dir_ino;
         inode->dir_contents = NULL;
         inode->use_count = 0;
         child->inode = inum;
@@ -276,10 +278,8 @@ static int write_dir(struct adfs_inode *dir)
 {
     struct adfs_directory *contents = dir->dir_contents;
     unsigned char buf[ADFS_DIR_SIZE];
-    unsigned new_seq = contents->footer[0x2f] + 1;
-    buf[0] = new_seq;
-    memcpy(buf+1, "Hugo", 4);
-    buf[0x4ff] = new_seq;
+    ++(contents->footer[0x2f]);
+    memcpy(buf, contents->footer + 0x2f, 5);
     struct adfs_dirent *child = contents->ents;
     unsigned num_ent = contents->num_ent;
     unsigned char *ptr = buf + DIR_HDR_SIZE;
@@ -304,17 +304,17 @@ static int write_dir(struct adfs_inode *dir)
         if (a & ATTR_OWRITE) ptr[6] |= 0x80;
         if (a & ATTR_OEXEC)  ptr[7] |= 0x80;
         if (a & ATTR_PRIV)   ptr[8] |= 0x80;
-        adfs_put24(ptr + 0x0a, inode->load_addr);
-        adfs_put24(ptr + 0x0e, inode->exec_addr);
-        adfs_put24(ptr + 0x12, inode->length);
+        adfs_put32(ptr + 0x0a, inode->load_addr);
+        adfs_put32(ptr + 0x0e, inode->exec_addr);
+        adfs_put32(ptr + 0x12, inode->length);
         adfs_put24(ptr + 0x16, inode->sector);
         child++;
         ptr += DIR_ENT_SIZE;
     }
     if (ptr < ftr)
         *ptr = 0;
-    memcpy(contents->footer, ftr, DIR_FTR_SIZE-1);
-    return writesect(dir->sector, buf, ADFS_DIR_SIZE);
+    memcpy(ftr, contents->footer, DIR_FTR_SIZE);
+    return writesect(dir->sector * ADFS_SECT_SIZE, buf, ADFS_DIR_SIZE);
 }
 
 static unsigned checksum(unsigned char *base)
@@ -472,7 +472,6 @@ static int move_file(struct adfs_inode *inode, unsigned dsect, size_t bytes)
             return err;
     }
     err = free_space(inode->sector, bytes);
-    inode->sector = dsect;
     return err;
 }
 
@@ -772,12 +771,15 @@ static void adfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t s
                             return;
                         }
                     }
+                    inode->sector = sector;
                 }
             }
             err = writesect(inode->sector * ADFS_SECT_SIZE + off, (unsigned char *)buf, size);
             if (!err) {
-                if (end > inode->length)
+                if (end > inode->length) {
                     inode->length = end;
+                    inode_tab[inode->parent].dir_contents->dirty++;
+                }
                 fuse_reply_write(req, size);
                 return;
             }
