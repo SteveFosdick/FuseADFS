@@ -183,6 +183,29 @@ static inline uint32_t adfs_get24(const unsigned char *base)
     return base[0] | (base[1] << 8) | (base[2] << 16);
 }
 
+static int new_inode(fuse_ino_t parent, unsigned sector, unsigned length, unsigned attr, unsigned load_addr, unsigned exec_addr)
+{
+    if (itab_used >= itab_alloc) {
+        size_t newsize = itab_alloc + INODE_CHUNK_SIZE;
+        struct adfs_inode *newtab = realloc(inode_tab, newsize * sizeof(struct adfs_inode));
+        if (!newtab)
+            return -errno;
+        inode_tab = newtab;
+        itab_alloc = newsize;
+    }
+    int inum = itab_used++;
+    struct adfs_inode *inode = inode_tab + inum;
+    inode->parent = parent;
+    inode->sector = sector;
+    inode->length = length;
+    inode->attr = attr;
+    inode->load_addr = load_addr;
+    inode->exec_addr = exec_addr;
+    inode->dir_contents = NULL;
+    inode->use_count = 0;
+    return inum;
+}
+
 static const char hst_chars[] = "#$%&.?@^";
 static const char bbc_chars[] = "?<;+/#=>";
 
@@ -210,16 +233,6 @@ static int scan_dir(struct adfs_inode *dir, unsigned char *data)
         child->name[i] = 0;
         if (!i)
             break;
-        if (itab_used >= itab_alloc) {
-            size_t newsize = itab_alloc + INODE_CHUNK_SIZE;
-            struct adfs_inode *newtab = realloc(inode_tab, newsize * sizeof(struct adfs_inode));
-            if (!newtab)
-                return errno;
-            inode_tab = newtab;
-            itab_alloc = newsize;
-        }
-        fuse_ino_t inum = itab_used++;
-        struct adfs_inode *inode = inode_tab + inum;
         unsigned a = 0;
         if (ptr[0] & 0x80) a |= ATTR_UREAD;
         if (ptr[1] & 0x80) a |= ATTR_UWRITE;
@@ -230,14 +243,9 @@ static int scan_dir(struct adfs_inode *dir, unsigned char *data)
         if (ptr[6] & 0x80) a |= ATTR_OWRITE;
         if (ptr[7] & 0x80) a |= ATTR_OEXEC;
         if (ptr[8] & 0x80) a |= ATTR_PRIV;
-        inode->attr      = a;
-        inode->load_addr = adfs_get32(ptr + 0x0a);
-        inode->exec_addr = adfs_get32(ptr + 0x0e);
-        inode->length    = adfs_get32(ptr + 0x12);
-        inode->sector    = adfs_get24(ptr + 0x16);
-        inode->parent    = dir_ino;
-        inode->dir_contents = NULL;
-        inode->use_count = 0;
+        int inum = new_inode(dir_ino, adfs_get24(ptr + 0x16), adfs_get32(ptr + 0x12), a, adfs_get32(ptr + 0x0a), adfs_get32(ptr + 0x0e));
+        if (inum < 0)
+            return -inum;
         child->inode = inum;
         child++;
         ptr += DIR_ENT_SIZE;
@@ -318,6 +326,59 @@ static int write_dir(struct adfs_inode *dir)
         *ptr = 0;
     memcpy(ftr, contents->footer, DIR_FTR_SIZE);
     return writesect(dir->sector * ADFS_SECT_SIZE, buf, ADFS_DIR_SIZE);
+}
+
+static int name_cmp(const char *pattern, const char *candidate)
+{
+    for (int c = ADFS_MAX_NAME; c; c--) {
+        int pat_ch = *pattern++;
+        int can_ch = *candidate++;
+        if (!pat_ch)
+            return (!can_ch || can_ch == 0x0d) ? 0 : 1;
+        int d = (pat_ch & 0x5f) - (can_ch & 0x5f);
+        if (d)
+            return d;
+    }
+    return 0;
+}
+
+static void print_dir(const char *when, struct adfs_directory *contents)
+{
+    unsigned num_ent = contents->num_ent;
+    struct adfs_dirent *child = contents->ents;
+    while (num_ent--) {
+        printf("%s: %ld %s\n", when, child->inode, child->name);
+        child++;
+    }
+}
+
+static int insert_name(struct adfs_inode *dir, const char *name, fuse_ino_t ino)
+{
+    struct adfs_directory *contents = dir->dir_contents;
+    print_dir("before", contents);
+    unsigned num_ent = contents->num_ent;
+    if (num_ent == DIR_MAX_ENT)
+        return ENOSPC;
+    struct adfs_dirent *child = contents->ents;
+    while (num_ent--) {
+        printf("insert_name: comparing %s <> %s\n", name, child->name);
+        int d = name_cmp(name, child->name);
+        if (!d)
+            return EEXIST;
+        if (d < 0)
+            break;
+        child++;
+    }
+    if (num_ent) {
+        size_t bytes = (num_ent + 1) * sizeof(struct adfs_dirent);
+        printf("num_ent=%d, next=%s, moving %ld bytes\n", num_ent, child->name, bytes);
+        memmove(child + 1, child, bytes);
+    }
+    strncpy(child->name, name, ADFS_MAX_NAME);
+    child->inode = ino;
+    contents->num_ent++;
+    print_dir("after", contents);
+    return 0;
 }
 
 static unsigned checksum(unsigned char *base)
@@ -511,16 +572,10 @@ static int adfs_ioselect(void)
     return 1;
 }
 
-static int adfs_stat(fuse_ino_t ino, struct stat *stp)
+static void fill_stat(fuse_ino_t ino, struct adfs_inode *inode, struct stat *stp)
 {
-    if (ino >= itab_used)
-        return -1;
-    struct adfs_inode *inode = inode_tab + ino;
-    unsigned attr = inode->attr;
-    if (attr & ATTR_DELETED)
-        return -1;
     mode_t mode;
-    memset(stp, 0, sizeof(struct stat));
+    unsigned attr = inode->attr;
     if (attr & ATTR_DIR) {
         mode = S_IFDIR;
         if (attr & ATTR_UREAD)
@@ -542,25 +597,22 @@ static int adfs_stat(fuse_ino_t ino, struct stat *stp)
     if (attr & ATTR_OWRITE)
         mode |= 0022;
     stp->st_mode = mode;
-    stp->st_ino = ino + 1;
+    stp->st_ino = ino;
     stp->st_size = inode->length;
     stp->st_uid = uid;
     stp->st_gid = gid;
-    return 0;
 }
 
-static int name_cmp(const char *pattern, const char *candidate)
+static void stat_reply(fuse_req_t req, fuse_ino_t ino, struct adfs_inode *inode)
 {
-    for (int c = ADFS_MAX_NAME; c; c--) {
-        int pat_ch = *pattern++;
-        int can_ch = *candidate++;
-        if (!pat_ch)
-            return (!can_ch || can_ch == 0x0d) ? 0 : 1;
-        int d = (pat_ch & 0x5f) - (can_ch & 0x5f);
-        if (d)
-            return d;
-    }
-    return 0;
+    struct fuse_entry_param e;
+    memset(&e, 0, sizeof(e));
+    fill_stat(ino, inode, &e.attr);
+    e.ino = ino;
+    e.attr_timeout = ULONG_MAX;
+    e.entry_timeout = ULONG_MAX;
+    inode->use_count++;
+    fuse_reply_entry(req, &e);
 }
 
 static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
@@ -579,16 +631,8 @@ static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
                     while (num_ent--) {
                         int d = name_cmp(name, ptr->name);
                         if (!d) {
-                            struct fuse_entry_param e;
-                            if (!adfs_stat(ptr->inode, &e.attr)) {
-                                e.ino = e.attr.st_ino;
-                                e.attr_timeout = ULONG_MAX;
-                                e.entry_timeout = ULONG_MAX;
-                                inode->use_count++;
-                                fuse_reply_entry(req, &e);
+                            stat_reply(req, ptr->inode + 1, inode_tab + ptr->inode);
                                 return;
-                            }
-                            break;
                         }
                         else if (d < 0)
                             break;
@@ -617,11 +661,43 @@ static void adfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
 
 static void adfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+    if (ino <= itab_used) {
+        struct adfs_inode *inode = inode_tab + ino - 1;
+        if (!(inode->attr & ATTR_DELETED)) {
     struct stat stbuf;
-    if (!adfs_stat(--ino, &stbuf))
-        fuse_reply_attr(req, &stbuf, 1.0);
-    else
+            memset(&stbuf, 0, sizeof(stbuf));
+            fill_stat(ino, inode, &stbuf);
+            fuse_reply_attr(req, &stbuf, ULONG_MAX);
+            return;
+        }
+    }
         fuse_reply_err(req, ENOENT);
+}
+
+static void adfs_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev)
+{
+    printf("mknod %ld %s\n", parent, name);
+    int err = ENOENT;
+    if (--parent < itab_used) {
+        struct adfs_inode *pnode = inode_tab + parent;
+        if (!(pnode->attr & ATTR_DELETED)) {
+            if ((mode & S_IFMT) == S_IFREG) {
+                int inum = new_inode(parent, 0, 0, ATTR_UREAD|ATTR_UWRITE, 0, 0);
+                if (inum >= 0) {
+                    err = insert_name(pnode, name, inum);
+                    if (!err) {
+                        stat_reply(req, inum+1, inode_tab + inum);
+                        return;
+                    }
+                }
+                else
+                    err = -inum;
+            }
+            else
+                err = ENOTSUP;
+        }
+    }
+    fuse_reply_err(req, err);
 }
 
 static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -702,8 +778,8 @@ static void adfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off,
             size_t avail = size;
             while (num_ent--) {
                 struct stat stb;
-                if ((err = adfs_stat(ent->inode, &stb)))
-                    break;
+                memset(&stb, 0, sizeof(stb));
+                fill_stat(ent->inode + 1, inode_tab + ent->inode, &stb);
                 size_t bytes = fuse_add_direntry(req, ptr, avail, ent->name, &stb, ++off);
                 if (bytes > avail)
                     break;
@@ -816,6 +892,7 @@ static const struct fuse_lowlevel_ops adfs_ops =
     .lookup  = adfs_lookup,
     .forget  = adfs_forget,
     .getattr = adfs_getattr,
+    .mknod   = adfs_mknod,
     .open    = adfs_open,
     .read    = adfs_read,
     .write   = adfs_write,
