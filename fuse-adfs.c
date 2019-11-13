@@ -373,7 +373,7 @@ static int insert_name(struct adfs_inode *dir, const char *name, fuse_ino_t ino)
     strncpy(child->name, name, ADFS_MAX_NAME);
     child->inode = ino;
     contents->num_ent++;
-    contents->dirty++;
+    contents->dirty = 1;
     return 0;
 }
 
@@ -438,7 +438,7 @@ static int extend_inplace(unsigned ssect, unsigned avail, size_t end)
                     adfs_put24(fsmap + ent, sector + reqd);
                     adfs_put24(fsmap + 0x100 + ent, size - reqd);
                 }
-                fsmap_dirty++;
+                fsmap_dirty = 1;
                 return 0;
             }
             else
@@ -467,7 +467,7 @@ static int alloc_space(size_t bytes)
                 adfs_put24(fsmap + ent, sector + reqd);
                 adfs_put24(fsmap + 0x100 + ent, size - reqd);
             }
-            fsmap_dirty++;
+            fsmap_dirty = 1;
             return sector;
         }
     }
@@ -485,7 +485,7 @@ static int free_space(unsigned sector, size_t length)
         if ((posn + size) == sector) { // coallesce
             size += sects;
             adfs_put24(fsmap + 0x100 + ent, size);
-            fsmap_dirty++;
+            fsmap_dirty = 1;
             return 0;
         }
         if (posn > sector) {
@@ -802,7 +802,7 @@ static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
                         return;
                     }
                     inode->length = 0;
-                    inode_tab[inode->parent].dir_contents->dirty++;
+                    inode_tab[inode->parent].dir_contents->dirty = 1;
                 }
                 fuse_reply_open(req, fi);
                 return;
@@ -933,7 +933,7 @@ static void adfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t s
             if (!err) {
                 if (end > inode->length) {
                     inode->length = end;
-                    inode_tab[inode->parent].dir_contents->dirty++;
+                    inode_tab[inode->parent].dir_contents->dirty = 1;
                 }
                 fuse_reply_write(req, size);
                 return;
