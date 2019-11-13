@@ -674,6 +674,16 @@ static void adfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *
         fuse_reply_err(req, ENOENT);
 }
 
+static unsigned mode2attr(mode_t mode)
+{
+    unsigned attr = 0;
+    if (mode & S_IRUSR) attr = ATTR_UREAD;
+    if (mode & S_IWUSR) attr = ATTR_UWRITE;
+    if (mode & (S_IRGRP|S_IROTH)) attr = ATTR_OREAD;
+    if (mode & (S_IWGRP|S_IWOTH)) attr = ATTR_OWRITE;
+    return attr;
+}
+
 static void adfs_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode_t mode, dev_t rdev)
 {
     printf("mknod %ld %s\n", parent, name);
@@ -682,7 +692,7 @@ static void adfs_mknod(fuse_req_t req, fuse_ino_t parent, const char *name, mode
         struct adfs_inode *pnode = inode_tab + parent;
         if (!(pnode->attr & ATTR_DELETED)) {
             if ((mode & S_IFMT) == S_IFREG) {
-                int inum = new_inode(parent, 0, 0, ATTR_UREAD|ATTR_UWRITE, 0, 0);
+                int inum = new_inode(parent, 0, 0, mode2attr(mode), 0, 0);
                 if (inum >= 0) {
                     err = insert_name(pnode, name, inum);
                     if (!err) {
