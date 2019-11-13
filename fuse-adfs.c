@@ -291,6 +291,9 @@ static int write_dir(struct adfs_inode *dir)
                 ptr[i] = 0x0d;
                 break;
             }
+            char *ptr = strchr(hst_chars, ch);
+            if (ptr)
+                ch = bbc_chars[ptr-hst_chars];
             ptr[i] = ch;
         }
         struct adfs_inode *inode = inode_tab + child->inode;
