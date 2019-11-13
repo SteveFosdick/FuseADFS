@@ -33,6 +33,7 @@
 #define ATTR_PRIV    0x0080
 #define ATTR_DIR     0x0100
 #define ATTR_SCANNED 0x1000
+#define ATTR_DELETED 0x2000
 
 struct adfs_directory;
 
@@ -44,6 +45,7 @@ struct adfs_inode {
     unsigned   length;
     unsigned   attr;
     struct adfs_directory *dir_contents;
+    unsigned   use_count;
 };
 
 static struct adfs_inode *inode_tab;
@@ -233,6 +235,7 @@ static int scan_dir(struct adfs_inode *dir, unsigned char *data)
         inode->length    = adfs_get32(ptr + 0x12);
         inode->sector    = adfs_get24(ptr + 0x16);
         inode->dir_contents = NULL;
+        inode->use_count = 0;
         child->inode = inum;
         child++;
         ptr += DIR_ENT_SIZE;
@@ -510,8 +513,10 @@ static int adfs_stat(fuse_ino_t ino, struct stat *stp)
 {
     if (ino >= itab_used)
         return -1;
-    struct adfs_inode *ent = inode_tab + ino;
-    unsigned attr = ent->attr;
+    struct adfs_inode *inode = inode_tab + ino;
+    unsigned attr = inode->attr;
+    if (attr & ATTR_DELETED)
+        return -1;
     mode_t mode;
     memset(stp, 0, sizeof(struct stat));
     if (attr & ATTR_DIR) {
@@ -536,7 +541,7 @@ static int adfs_stat(fuse_ino_t ino, struct stat *stp)
         mode |= 0022;
     stp->st_mode = mode;
     stp->st_ino = ino + 1;
-    stp->st_size = ent->length;
+    stp->st_size = inode->length;
     stp->st_uid = uid;
     stp->st_gid = gid;
     return 0;
@@ -558,42 +563,54 @@ static int name_cmp(const char *pattern, const char *candidate)
 
 static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
 {
+    int err = ENOENT;
     if (--parent < itab_used && strlen(name) <= ADFS_MAX_NAME) {
-        struct adfs_inode *ent = inode_tab + parent;
-        if (ent->attr & ATTR_DIR) {
-            int err = read_dir(ent);
-            if (!err) {
-                struct adfs_directory *contents = inode_tab[parent].dir_contents;
-                unsigned num_ent = contents->num_ent;
-                struct adfs_dirent *ptr = contents->ents;
-                while (num_ent--) {
-                    int d = name_cmp(name, ptr->name);
-                    if (!d) {
-                        struct fuse_entry_param e;
-                        if (!adfs_stat(ptr->inode, &e.attr)) {
-                            e.ino = e.attr.st_ino;
-                            e.attr_timeout = ULONG_MAX;
-                            e.entry_timeout = ULONG_MAX;
-                            fuse_reply_entry(req, &e);
+        struct adfs_inode *inode = inode_tab + parent;
+        unsigned attr = inode->attr;
+        if (!(attr & ATTR_DELETED)) {
+            if (attr & ATTR_DIR) {
+                err = read_dir(inode);
+                if (!err) {
+                    struct adfs_directory *contents = inode_tab[parent].dir_contents;
+                    unsigned num_ent = contents->num_ent;
+                    struct adfs_dirent *ptr = contents->ents;
+                    while (num_ent--) {
+                        int d = name_cmp(name, ptr->name);
+                        if (!d) {
+                            struct fuse_entry_param e;
+                            if (!adfs_stat(ptr->inode, &e.attr)) {
+                                e.ino = e.attr.st_ino;
+                                e.attr_timeout = ULONG_MAX;
+                                e.entry_timeout = ULONG_MAX;
+                                inode->use_count++;
+                                fuse_reply_entry(req, &e);
+                                return;
+                            }
+                            break;
                         }
-                        else
-                            fuse_reply_err(req, ENOENT);
-                        return;
+                        else if (d < 0)
+                            break;
+                        ptr++;
                     }
-                    else if (d < 0)
-                        break;
-                    ptr++;
+                    err = ENOENT;
                 }
-                fuse_reply_err(req, ENOENT);
             }
-            else
-                fuse_reply_err(req, err);
         }
-        else
-            fuse_reply_err(req, ENOTDIR);
     }
-    else
-        fuse_reply_err(req, ENOENT);
+    fuse_reply_err(req, err);
+}
+
+static void adfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
+{
+    printf("forget %ld\n", ino);
+    if (--ino < itab_used) {
+        struct adfs_inode *inode = inode_tab + ino;
+        if (--inode->use_count == 0)
+            if (!(inode->attr & ATTR_DELETED))
+                if (!free_space(inode->sector, inode->length))
+                    inode->attr |= ATTR_DELETED;
+    }
+    fuse_reply_none(req);
 }
 
 static void adfs_getattr(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -609,173 +626,190 @@ static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     printf("open: %ld\n", ino);
 
+    int err = ENOENT;
     if (--ino < itab_used) {
-        mode_t accmode = fi->flags & O_ACCMODE;
-        unsigned mask;
-        if (accmode == O_RDONLY)
-            mask = ATTR_UREAD;
-        else if (options.read_only) {
-            fuse_reply_err(req, EROFS);
-            return;
-        }
-        else if (accmode == O_WRONLY)
-            mask = ATTR_UWRITE;
-        else
-            mask = ATTR_UREAD|ATTR_UWRITE;
-        if ((inode_tab[ino].attr & mask) == mask) {
-            if (fi->flags & O_TRUNC) {
-                struct adfs_inode *inode = inode_tab + ino;
-                int err = free_space(inode->sector, inode->length);
-                if (err) {
-                    fuse_reply_err(req, err);
-                    return;
-                }
-                inode->length = 0;
-                inode_tab[inode->parent].dir_contents->dirty = 1;
+        struct adfs_inode *inode = inode_tab + ino;
+        if (!(inode->attr & ATTR_DELETED)) {
+            mode_t accmode = fi->flags & O_ACCMODE;
+            unsigned mask;
+            if (accmode == O_RDONLY)
+                mask = ATTR_UREAD;
+            else if (options.read_only) {
+                fuse_reply_err(req, EROFS);
+                return;
             }
-            fuse_reply_open(req, fi);
+            else if (accmode == O_WRONLY)
+                mask = ATTR_UWRITE;
+            else
+                mask = ATTR_UREAD|ATTR_UWRITE;
+            if ((inode->attr & mask) == mask) {
+                if (fi->flags & O_TRUNC) {
+                    err = free_space(inode->sector, inode->length);
+                    if (err) {
+                        fuse_reply_err(req, err);
+                        return;
+                    }
+                    inode->length = 0;
+                    inode_tab[inode->parent].dir_contents->dirty = 1;
+                }
+                fuse_reply_open(req, fi);
+                return;
+            }
+            else
+                err = EACCES;
         }
-        else
-            fuse_reply_err(req, EACCES);
     }
-    else
-        fuse_reply_err(req, ENOENT);
+    fuse_reply_err(req, err);
 }
 
 static void adfs_opendir(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
+    int err = ENOENT;
     if (--ino < itab_used) {
-        if (inode_tab[ino].attr & ATTR_UREAD) {
-            int err = read_dir(inode_tab + ino);
-            if (!err) {
-                struct fuse_file_info fi;
-                memset(&fi, 0, sizeof(fi));
-                fi.cache_readdir = 1;
-                fuse_reply_open(req, &fi);
+        struct adfs_inode *inode = inode_tab + ino;
+        unsigned attr = inode->attr;
+        if (!(attr & ATTR_DELETED)) {
+            if (attr & ATTR_UREAD) {
+                err = read_dir(inode);
+                if (!err) {
+                    struct fuse_file_info fi;
+                    fi.cache_readdir = 1;
+                    fuse_reply_open(req, &fi);
+                    return;
+                }
             }
             else
-                fuse_reply_err(req, err);
+                err = EACCES;
         }
-        else
-            fuse_reply_err(req, EACCES);
     }
-    else
-        fuse_reply_err(req, ENOENT);
+    fuse_reply_err(req, err);
 }
 
 static void adfs_readdir(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
+    int err = ENOENT;
     if (--ino < itab_used) {
-        struct adfs_directory *contents = inode_tab[ino].dir_contents;
-        struct adfs_dirent *ent = contents->ents + off;
-        unsigned num_ent = contents->num_ent - off;
-        int err = 0;
-        char buf[size];
-        char *ptr = buf;
-        size_t avail = size;
-        while (num_ent--) {
-            struct stat stb;
-            if ((err = adfs_stat(ent->inode, &stb)))
-                break;
-            size_t bytes = fuse_add_direntry(req, ptr, avail, ent->name, &stb, ++off);
-            if (bytes > avail)
-                break;
-            ptr += bytes;
-            avail -= bytes;
-            ent++;
+        struct adfs_inode *inode = inode_tab + ino;
+        if (!(inode->attr & ATTR_DELETED)) {
+            struct adfs_directory *contents = inode->dir_contents;
+            struct adfs_dirent *ent = contents->ents + off;
+            unsigned num_ent = contents->num_ent - off;
+            err = 0;
+            char buf[size];
+            char *ptr = buf;
+            size_t avail = size;
+            while (num_ent--) {
+                struct stat stb;
+                if ((err = adfs_stat(ent->inode, &stb)))
+                    break;
+                size_t bytes = fuse_add_direntry(req, ptr, avail, ent->name, &stb, ++off);
+                if (bytes > avail)
+                    break;
+                ptr += bytes;
+                avail -= bytes;
+                ent++;
+            }
+            if (!err) {
+                fuse_reply_buf(req, buf, ptr - buf);
+                return;
+            }
         }
-        if (err)
-            fuse_reply_err(req, err);
-        else
-            fuse_reply_buf(req, buf, ptr - buf);
     }
-    else
-        fuse_reply_err(req, ENOENT);
+    fuse_reply_err(req, err);
 }
 
 static void adfs_read(fuse_req_t req, fuse_ino_t ino, size_t size, off_t off, struct fuse_file_info *fi)
 {
+    int err = ENOENT;
     if (--ino < itab_used) {
-        struct adfs_inode *ent = inode_tab + ino;
-        off_t left = ent->length - off;
-        if (left < 0)
-            fuse_reply_buf(req, 0, 0);
-        else {
-            if (size > left)
-                size = left;
-            unsigned char buf[size];
-            int err = readsect(inode_tab[ino].sector * ADFS_SECT_SIZE + off, buf, size);
-            if (!err)
-                fuse_reply_buf(req, (char *)buf, size);
-            else
-                fuse_reply_err(req, err);
+        struct adfs_inode *inode = inode_tab + ino;
+        if (!(inode->attr & ATTR_DELETED)) {
+            off_t left = inode->length - off;
+            if (left < 0) {
+                fuse_reply_buf(req, 0, 0);
+                return;
+            }
+            else {
+                if (size > left)
+                    size = left;
+                unsigned char buf[size];
+                int err = readsect(inode->sector * ADFS_SECT_SIZE + off, buf, size);
+                if (!err) {
+                    fuse_reply_buf(req, (char *)buf, size);
+                    return;
+                }
+            }
         }
     }
-    else
-        fuse_reply_err(req, ENOENT);
+    fuse_reply_err(req, err);
 }
 
 static void adfs_write(fuse_req_t req, fuse_ino_t ino, const char *buf, size_t size, off_t off, struct fuse_file_info *fi)
 {
     printf("adfs_write: ino=%ld, size=%ld,off=%ld\n", ino, size, off);
 
+    int err = ENOENT;
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
-        size_t end = off + size;
-        size_t avail = (inode->length + 255) & ~0xff;
-        printf("adfs_write: end=%ld, avail=%ld\n", end, avail);
-        if (end > avail) {
-            fputs("adfs_write: need more space\n", stdout);
-            if (avail == 0 || extend_inplace(inode->sector, avail, end)) {
-                fputs("adfs_write: can't extend in place\n", stdout);
-                unsigned sector = alloc_space(end);
-                printf("adfs_write: new start sector %d\n", sector);
-                if (!sector) {
-                    fuse_reply_err(req, ENOSPC);
-                    return;
-                }
-                if (avail) {
-                    int err = move_file(inode, sector, avail);
-                    if (err) {
-                        fuse_reply_err(req, err);
+        if (!(inode->attr & ATTR_DELETED)) {
+            size_t end = off + size;
+            size_t avail = (inode->length + 255) & ~0xff;
+            printf("adfs_write: end=%ld, avail=%ld\n", end, avail);
+            if (end > avail) {
+                fputs("adfs_write: need more space\n", stdout);
+                if (avail == 0 || extend_inplace(inode->sector, avail, end)) {
+                    fputs("adfs_write: can't extend in place\n", stdout);
+                    unsigned sector = alloc_space(end);
+                    printf("adfs_write: new start sector %d\n", sector);
+                    if (!sector) {
+                        fuse_reply_err(req, ENOSPC);
                         return;
+                    }
+                    if (avail) {
+                        int err = move_file(inode, sector, avail);
+                        if (err) {
+                            fuse_reply_err(req, err);
+                            return;
+                        }
                     }
                 }
             }
+            err = writesect(inode->sector * ADFS_SECT_SIZE + off, (unsigned char *)buf, size);
+            if (!err) {
+                if (end > inode->length)
+                    inode->length = end;
+                fuse_reply_write(req, size);
+                return;
+            }
         }
-        int err = writesect(inode->sector * ADFS_SECT_SIZE + off, (unsigned char *)buf, size);
-        if (!err) {
-            if (end > inode->length)
-                inode->length = end;
-            fuse_reply_write(req, size);
-        }
-        else
-            fuse_reply_err(req, err);
     }
-    else
-        fuse_reply_err(req, ENOENT);
+    fuse_reply_err(req, err);
 }
 
 static void adfs_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     if (--ino < itab_used) {
-        struct adfs_inode *parent = inode_tab + inode_tab[ino].parent;
-        int err1 = 0, err2 = 0;
-        if (parent->dir_contents->dirty)
-            err1 = write_dir(parent);
-        if (map_dirty)
-            err2 = write_fsmap();
-        if (!err1)
-            err1 = err2;
-        fuse_reply_err(req, err1);
+        struct adfs_inode *inode = inode_tab + ino;
+        if (!(inode->attr & ATTR_DELETED)) {
+            struct adfs_inode *parent = inode_tab + inode->parent;
+            int err1 = 0, err2 = 0;
+            if (parent->dir_contents->dirty)
+                err1 = write_dir(parent);
+            if (map_dirty)
+                err2 = write_fsmap();
+            if (!err1)
+                err1 = err2;
+            fuse_reply_err(req, err1);
+            return;
+        }
     }
-    else
-        fuse_reply_err(req, ENOENT);
+    fuse_reply_err(req, ENOENT);
 }
 
 static const struct fuse_lowlevel_ops adfs_ops =
 {
     .lookup  = adfs_lookup,
+    .forget  = adfs_forget,
     .getattr = adfs_getattr,
     .open    = adfs_open,
     .read    = adfs_read,
