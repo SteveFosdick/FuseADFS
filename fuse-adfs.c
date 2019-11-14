@@ -513,7 +513,7 @@ static int alloc_space(size_t bytes)
                 size_t bytes = (num_ent - ent) * 3;
                 memmove(fsmap + ent, fsmap + ent + 3, bytes);
                 memmove(fsmap + 0x100 + ent, fsmap + 0x100 + ent + 3, bytes);
-                fsmap[0x1fe]--;
+                fsmap[0x1fe] -= 3;
             }
             else {
                 adfs_put24(fsmap + ent, sector + reqd);
@@ -566,7 +566,7 @@ static int free_space(unsigned sector, size_t length)
     debug("free_space: new entry, posn=%d, size=%d\n", sector, sects);
     adfs_put24(fsmap + ent, sector);
     adfs_put24(fsmap + 0x100 + ent, sects);
-    fsmap[0x1fe]++;
+    fsmap[0x1fe] += 3;
     fsmap_dirty = 1;
     print_map("after");
     return 0;
