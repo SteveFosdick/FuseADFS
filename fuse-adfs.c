@@ -32,7 +32,6 @@
 #define ATTR_OEXEC   0x0040
 #define ATTR_PRIV    0x0080
 #define ATTR_DIR     0x0100
-#define ATTR_SCANNED 0x1000
 #define ATTR_DELETED 0x2000
 #define ATTR_DELPEND 0x4000
 
@@ -93,10 +92,60 @@ static gid_t gid;
 static unsigned char fsmap[FSMAP_SIZE];
 static int fsmap_dirty;
 
+static inline uint32_t adfs_get32(const unsigned char *base)
+{
+    return base[0] | (base[1] << 8) | (base[2] << 16) | (base[3] << 24);
+}
+
+static inline uint32_t adfs_get24(const unsigned char *base)
+{
+    return base[0] | (base[1] << 8) | (base[2] << 16);
+}
+
+static inline void adfs_put32(unsigned char *base, uint32_t value)
+{
+    base[0] = value & 0xff;
+    base[1] = (value >> 8) & 0xff;
+    base[2] = (value >> 16) & 0xff;
+    base[3] = (value >> 24) & 0xff;
+}
+
+static inline void adfs_put24(unsigned char *base, uint32_t value)
+{
+    base[0] = value & 0xff;
+    base[1] = (value >> 8) & 0xff;
+    base[2] = (value >> 16) & 0xff;
+}
+
 #ifdef DEBUG
 #define debug(...) fuse_log(FUSE_LOG_DEBUG, __VA_ARGS__)
+
+static void print_dir(const char *when, struct adfs_directory *contents)
+{
+    unsigned num_ent = contents->num_ent;
+    fuse_log(FUSE_LOG_DEBUG, "%s: entries=%d\n", when, num_ent);
+    struct adfs_dirent *child = contents->ents;
+    while (num_ent--) {
+        fuse_log(FUSE_LOG_DEBUG, "%s: %ld %s %c\n", when, child->inode, child->name, inode_tab[child->inode].attr & ATTR_DIR ? 'd' : '-');
+        child++;
+    }
+}
+
+static void print_map(const char *when)
+{
+    int num_ent = fsmap[0x1fe];
+    fuse_log(FUSE_LOG_DEBUG, "%s: entries=%d\n", when, num_ent);
+    for (int ent = 0; ent < num_ent; ent += 3) {
+        unsigned posn = adfs_get24(fsmap + ent);
+        unsigned size = adfs_get24(fsmap + 0x100 + ent);
+        fuse_log(FUSE_LOG_DEBUG, "%s: posn=%d, size=%d\n", when, posn, size);
+    }
+}
+
 #else
 #define debug(...)
+#define print_dir(when, contents)
+#define print_map(when)
 #endif
 
 static int rdsect_simple(off_t posn, unsigned char *buf, size_t size)
@@ -179,16 +228,6 @@ static void make_root(struct adfs_inode *root)
     root->length = ADFS_DIR_SIZE;
     root->attr = ATTR_UREAD|ATTR_UWRITE|ATTR_DIR;
     root->dir_contents = NULL;
-}
-
-static inline uint32_t adfs_get32(const unsigned char *base)
-{
-    return base[0] | (base[1] << 8) | (base[2] << 16) | (base[3] << 24);
-}
-
-static inline uint32_t adfs_get24(const unsigned char *base)
-{
-    return base[0] | (base[1] << 8) | (base[2] << 16);
 }
 
 static int new_inode(fuse_ino_t parent, unsigned sector, unsigned length, unsigned attr, unsigned load_addr, unsigned exec_addr)
@@ -300,21 +339,6 @@ static int read_dir(struct adfs_inode *dir)
     if (!err)
         err = scan_dir(dir, buf);
     return err;
-}
-
-static inline void adfs_put32(unsigned char *base, uint32_t value)
-{
-    base[0] = value & 0xff;
-    base[1] = (value >> 8) & 0xff;
-    base[2] = (value >> 16) & 0xff;
-    base[3] = (value >> 24) & 0xff;
-}
-
-static inline void adfs_put24(unsigned char *base, uint32_t value)
-{
-    base[0] = value & 0xff;
-    base[1] = (value >> 8) & 0xff;
-    base[2] = (value >> 16) & 0xff;
 }
 
 static int write_dir(struct adfs_inode *dir)
@@ -504,6 +528,7 @@ static int free_space(unsigned sector, size_t length)
     size_t sects = (length + 255) >> 8;
     int num_ent = fsmap[0x1fe];
     int ent;
+    print_map("before");
     for (ent = 0; ent < num_ent; ent += 3) {
         unsigned posn = adfs_get24(fsmap + ent);
         unsigned size = adfs_get24(fsmap + 0x100 + ent);
@@ -540,6 +565,7 @@ static int free_space(unsigned sector, size_t length)
     adfs_put24(fsmap + 0x100 + ent, sects);
     fsmap[0x1fe]++;
     fsmap_dirty = 1;
+    print_map("after");
     return 0;
 }
 
@@ -847,6 +873,7 @@ static void delete_common(fuse_req_t req, fuse_ino_t parent, const char *name, i
                         debug("delete_common: comparing %s <> %s\n", name, child->name);
                         int d = name_cmp(bbc_name, child->name);
                         if (!d) {
+                            print_dir("before", contents);
                             if (!(err = callback(child))) {
                                 if (++num_ent > 0) {
                                     size_t bytes = num_ent * sizeof(struct adfs_dirent);
@@ -855,6 +882,7 @@ static void delete_common(fuse_req_t req, fuse_ino_t parent, const char *name, i
                                 }
                                 contents->num_ent--;
                                 contents->dirty = 1;
+                                print_dir("after", contents);
                             }
                             break;
                         }
