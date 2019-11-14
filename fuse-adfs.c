@@ -34,6 +34,7 @@
 #define ATTR_DIR     0x0100
 #define ATTR_SCANNED 0x1000
 #define ATTR_DELETED 0x2000
+#define ATTR_DELPEND 0x4000
 
 struct adfs_directory;
 
@@ -508,13 +509,24 @@ static int free_space(unsigned sector, size_t length)
         unsigned size = adfs_get24(fsmap + 0x100 + ent);
         if ((posn + size) == sector) { // coallesce
             size += sects;
+            debug("free_space: coalescing with previous, posn=%d, new_size=%d\n", posn, size);
             adfs_put24(fsmap + 0x100 + ent, size);
             fsmap_dirty = 1;
             return 0;
         }
         if (posn > sector) {
+            if ((sector + sects) == posn) {
+                posn = sector;
+                size += sects;
+                debug("free_space: coalescing with next, new_posn=%d, new_size=%d\n", posn, size);
+                adfs_put24(fsmap + ent, posn);
+                adfs_put24(fsmap + 0x100 + ent, size);
+                fsmap_dirty = 1;
+                return 0;
+            }
             if (num_ent >= FSMAP_MAX_ENT)
                 return ENOSPC;
+            debug("free_space: inserting new entry\n");
             size_t bytes = (num_ent - ent) * 3;
             memmove(fsmap + ent + 3, fsmap + ent, bytes);
             memmove(fsmap + 0x100 + ent + 3, fsmap + 0x100 + ent, bytes);
@@ -523,9 +535,11 @@ static int free_space(unsigned sector, size_t length)
     }
     if (num_ent >= FSMAP_MAX_ENT)
         return ENOSPC;
+    debug("free_space: new entry, posn=%d, size=%d\n", sector, sects);
     adfs_put24(fsmap + ent, sector);
     adfs_put24(fsmap + 0x100 + ent, sects);
     fsmap[0x1fe]++;
+    fsmap_dirty = 1;
     return 0;
 }
 
@@ -594,23 +608,26 @@ static void write_dirty(void)
     struct adfs_inode *inode = inode_tab;
     struct adfs_inode *end = inode + itab_used;
     while (inode < end) {
-        struct adfs_directory *dir = inode->dir_contents;
-        debug("write_dirty: checking inode %p, dir=%p\n", inode, dir);
-        if (dir && dir->dirty) {
-            debug("dirty, writing dir\n");
-            int err = write_dir(inode);
-            if (err)
-                fuse_log(FUSE_LOG_ERR, "%s: %s: unable to write directory back to filesystem: %s\n", program_invocation_short_name, dev_name, strerror(err));
+        if (inode->attr & ATTR_DELPEND)
+            debug("write_dirty: pending delete\n");
+        if (!(inode->attr & ATTR_DELETED)) {
+            struct adfs_directory *dir = inode->dir_contents;
+            if (dir && dir->dirty) {
+                debug("write_dirty: writing dir %s\n", dir->footer+1);
+                int err = write_dir(inode);
+                if (err)
+                    fuse_log(FUSE_LOG_ERR, "%s: %s: unable to write directory back to filesystem: %s\n", program_invocation_short_name, dev_name, strerror(err));
+            }
         }
         ++inode;
     }
     if (fsmap_dirty) {
-        fuse_log(FUSE_LOG_DEBUG, "writing fsmap");
+        fuse_log(FUSE_LOG_DEBUG, "write_dirty: writing fsmap\n");
         int err = write_fsmap();
         if (err)
             fuse_log(FUSE_LOG_ERR, "%s: %s: unable to write free space map back to filesystem: %s\n", program_invocation_short_name, dev_name, strerror(err));
     }
-    fuse_log(FUSE_LOG_DEBUG, "done");
+    fuse_log(FUSE_LOG_DEBUG, "done\n");
 }
 
 static void fill_stat(fuse_ino_t ino, struct adfs_inode *inode, struct stat *stp)
@@ -697,10 +714,13 @@ static void adfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
     debug("forget %ld\n", ino);
     if (--ino < itab_used) {
         struct adfs_inode *inode = inode_tab + ino;
-        if (--inode->use_count == 0)
-            if (!(inode->attr & ATTR_DELETED))
+        if (!(inode->use_count -= nlookup)) {
+            if (inode->attr & ATTR_DELPEND) {
+                debug("forget: processing pending delete\n");
                 if (!free_space(inode->sector, inode->length))
-                    inode->attr |= ATTR_DELETED;
+                    inode->attr = (inode->attr & ~ATTR_DELPEND) | ATTR_DELETED;
+            }
+        }
     }
     fuse_reply_none(req);
 }
@@ -807,6 +827,79 @@ static void adfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode
         }
     }
     fuse_reply_err(req, err);
+}
+
+static void delete_common(fuse_req_t req, fuse_ino_t parent, const char *name, int (*callback)(struct adfs_dirent *child))
+{
+    int err = EROFS;
+    if (!options.read_only) {
+        err = ENOENT;
+        if (--parent < itab_used) {
+            struct adfs_inode *pnode = inode_tab + parent;
+            if (!(pnode->attr & ATTR_DELETED)) {
+                char bbc_name[ADFS_MAX_NAME];
+                if (!(err = hst2bbc(bbc_name, name))) {
+                    err = ENOENT;
+                    struct adfs_directory *contents = pnode->dir_contents;
+                    int num_ent = contents->num_ent;
+                    struct adfs_dirent *child = contents->ents;
+                    while (num_ent--) {
+                        debug("delete_common: comparing %s <> %s\n", name, child->name);
+                        int d = name_cmp(bbc_name, child->name);
+                        if (!d) {
+                            if (!(err = callback(child))) {
+                                if (++num_ent > 0) {
+                                    size_t bytes = num_ent * sizeof(struct adfs_dirent);
+                                    debug("delete_common: num_ent=%d, next=%s, moving %ld bytes\n", num_ent, child->name, bytes);
+                                    memmove(child, child+1, bytes);
+                                }
+                                contents->num_ent--;
+                                contents->dirty = 1;
+                            }
+                            break;
+                        }
+                        if (d < 0)
+                            break;
+                        child++;
+                    }
+                }
+            }
+        }
+    }
+    fuse_reply_err(req, err);
+}
+
+static int delete_file(struct adfs_dirent *child)
+{
+    struct adfs_inode *inode = inode_tab + child->inode;
+    if (inode->attr & ATTR_DIR)
+        return EISDIR;
+    inode->attr |= ATTR_DELPEND;
+    return 0;
+}
+
+static void adfs_unlink(fuse_req_t req, fuse_ino_t parent, const char *name)
+{
+    debug("unlink %ld %s\n", parent, name);
+    delete_common(req, parent, name, delete_file);
+}
+
+static int delete_dir(struct adfs_dirent *child)
+{
+    struct adfs_inode *inode = inode_tab + child->inode;
+    if (!(inode->attr & ATTR_DIR))
+        return ENOTDIR;
+    read_dir(inode);
+    if (inode->dir_contents->num_ent)
+        return ENOTEMPTY;
+    inode->attr |= ATTR_DELPEND;
+    return 0;
+}
+
+static void adfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
+{
+    debug("rmdir %ld %s\n", parent, name);
+    delete_common(req, parent, name, delete_dir);
 }
 
 static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
@@ -1009,6 +1102,8 @@ static const struct fuse_lowlevel_ops adfs_ops =
     .getattr = adfs_getattr,
     .mknod   = adfs_mknod,
     .mkdir   = adfs_mkdir,
+    .unlink  = adfs_unlink,
+    .rmdir   = adfs_rmdir,
     .open    = adfs_open,
     .read    = adfs_read,
     .write   = adfs_write,
