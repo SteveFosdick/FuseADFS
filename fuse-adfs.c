@@ -878,7 +878,7 @@ static void delete_common(fuse_req_t req, fuse_ino_t parent, const char *name, i
                         if (!d) {
                             print_dir("before", contents);
                             if (!(err = callback(child))) {
-                                if (++num_ent > 0) {
+                                if (num_ent > 0) {
                                     size_t bytes = num_ent * sizeof(struct adfs_dirent);
                                     debug("delete_common: num_ent=%d, next=%s, moving %ld bytes\n", num_ent, child->name, bytes);
                                     memmove(child, child+1, bytes);
