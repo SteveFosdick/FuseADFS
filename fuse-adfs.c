@@ -352,14 +352,17 @@ static int write_dir(struct adfs_inode *dir)
     unsigned char *ent = buf + DIR_HDR_SIZE;
     unsigned char *ftr = buf + ADFS_DIR_SIZE - DIR_FTR_SIZE;
     while (num_ent--) {
-        for (int i = 0; i < ADFS_MAX_NAME; ++i) {
+        int i = 0;
+        while (i < ADFS_MAX_NAME) {
             int ch = child->name[i];
             if (!ch) {
-                ent[i] = 0x0d;
+                ent[i++] = 0x0d;
                 break;
             }
-            ent[i] = ch;
+            ent[i++] = ch;
         }
+        while (i < ADFS_MAX_NAME)
+            ent[i++] = 0;
         struct adfs_inode *inode = inode_tab + child->inode;
         unsigned a = inode->attr;
         if (a & ATTR_UREAD)  ent[0] |= 0x80;
