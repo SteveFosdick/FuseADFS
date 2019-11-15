@@ -429,6 +429,35 @@ static int insert_name(struct adfs_inode *dir, const char *name, fuse_ino_t ino)
     return 0;
 }
 
+static struct adfs_dirent *find_name(struct adfs_inode *dir, const char *name)
+{
+    struct adfs_directory *contents = dir->dir_contents;
+    int num_ent = contents->num_ent;
+    struct adfs_dirent *child = contents->ents;
+    while (num_ent--) {
+        int d = name_cmp(name, child->name);
+        if (!d)
+            return child;
+        if (d < 0)
+            break;
+        child++;
+    }
+    return NULL;
+}
+
+static void delete_name(struct adfs_inode *dir, struct adfs_dirent *ent)
+{
+    struct adfs_directory *contents = dir->dir_contents;
+    int after = contents->num_ent - (ent - contents->ents);
+    if (after > 0) {
+        size_t bytes = after * sizeof(struct adfs_dirent);
+        debug("delete_common: after=%d, next=%s, moving %ld bytes\n", after, ent->name, bytes);
+        memmove(ent, ent+1, bytes);
+    }
+    contents->num_ent--;
+    contents->dirty = 1;
+}
+
 static unsigned checksum(unsigned char *base)
 {
     int i = 255, c = 0;
@@ -933,6 +962,61 @@ static void adfs_rmdir(fuse_req_t req, fuse_ino_t parent, const char *name)
     delete_common(req, parent, name, delete_dir);
 }
 
+static void adfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fuse_ino_t newparent, const char *newname, unsigned int flags)
+{
+    debug("rename %ld %s to %ld %s, flags=%d\n", parent, name, newparent, newname, flags);
+    int err = ENOENT;
+    if (--parent < itab_used && --newparent < itab_used) {
+        struct adfs_inode *opnode = inode_tab + parent;
+        struct adfs_inode *npnode = inode_tab + newparent;
+        char old_bbc_name[ADFS_MAX_NAME];
+        if (!(err = hst2bbc(old_bbc_name, name))) {
+            char new_bbc_name[ADFS_MAX_NAME];
+            if (!(err = hst2bbc(new_bbc_name, newname))) {
+                err = ENOENT;
+                struct adfs_dirent *old_ent = find_name(opnode, old_bbc_name);
+                if (old_ent) {
+                    struct adfs_dirent *new_ent;
+                    switch(flags) {
+                        case RENAME_EXCHANGE:
+                            debug("rename: exchange\n");
+                            new_ent = find_name(npnode, new_bbc_name);
+                            if (new_ent) {
+                                int inode = old_ent->inode;
+                                old_ent->inode = new_ent->inode;
+                                new_ent->inode = inode;
+                                opnode->dir_contents->dirty = 1;
+                                npnode->dir_contents->dirty = 1;
+                                err = 0;
+                            }
+                            break;
+                        case RENAME_NOREPLACE:
+                            debug("rename: noreplace\n");
+                            if (find_name(npnode, new_bbc_name))
+                                err = EEXIST;
+                            else if (parent == newparent) {
+                                memcpy(old_ent->name, new_bbc_name, ADFS_MAX_NAME);
+                                err = 0;
+                            }
+                            else if (!(err = insert_name(npnode, new_bbc_name, old_ent->inode)))
+                                delete_name(opnode, old_ent);
+                            break;
+                        default:
+                            new_ent = find_name(npnode, new_bbc_name);
+                            if (new_ent) {
+                                inode_tab[new_ent->inode].attr |= ATTR_DELPEND;
+                                delete_name(npnode, new_ent);
+                            }
+                            if (!(err = insert_name(npnode, new_bbc_name, old_ent->inode)))
+                                delete_name(opnode, old_ent);
+                    }
+                }
+            }
+        }
+    }
+    fuse_reply_err(req, err);
+}
+
 static void adfs_open(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi)
 {
     debug("open: %ld\n", ino);
@@ -1135,6 +1219,7 @@ static const struct fuse_lowlevel_ops adfs_ops =
     .mkdir   = adfs_mkdir,
     .unlink  = adfs_unlink,
     .rmdir   = adfs_rmdir,
+    .rename  = adfs_rename,
     .open    = adfs_open,
     .read    = adfs_read,
     .write   = adfs_write,
