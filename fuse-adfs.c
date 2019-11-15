@@ -744,19 +744,10 @@ static void adfs_lookup(fuse_req_t req, fuse_ino_t parent, const char *name)
                 if (attr & ATTR_DIR) {
                     err = read_dir(inode);
                     if (!err) {
-                        struct adfs_directory *contents = inode_tab[parent].dir_contents;
-                        unsigned num_ent = contents->num_ent;
-                        struct adfs_dirent *ptr = contents->ents;
-                        while (num_ent--) {
-                            int d = name_cmp(bbc_name, ptr->name);
-                            debug("comparing %s <> %s -> %d\n", bbc_name, ptr->name, d);
-                            if (!d) {
-                                stat_reply(req, ptr->inode + 1, inode_tab + ptr->inode);
-                                    return;
-                            }
-                            else if (d < 0)
-                                break;
-                            ptr++;
+                        struct adfs_dirent *ent = find_name(inode_tab + parent, bbc_name);
+                        if (ent) {
+                            stat_reply(req, ent->inode + 1, inode_tab + ent->inode);
+                            return;
                         }
                         err = ENOENT;
                     }
