@@ -865,6 +865,7 @@ static void adfs_mkdir(fuse_req_t req, fuse_ino_t parent, const char *name, mode
                             }
                             else
                                 err = -inum;
+                            free_space(sector, ADFS_DIR_SIZE);
                         }
                         else
                             err = ENOSPC;
