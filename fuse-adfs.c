@@ -91,6 +91,7 @@ static uid_t uid;
 static gid_t gid;
 static unsigned char fsmap[FSMAP_SIZE];
 static int fsmap_dirty;
+static int deletes_pending;
 
 static inline uint32_t adfs_get32(const unsigned char *base)
 {
@@ -766,8 +767,10 @@ static void adfs_forget(fuse_req_t req, fuse_ino_t ino, uint64_t nlookup)
         if (!(inode->use_count -= nlookup)) {
             if (inode->attr & ATTR_DELPEND) {
                 debug("forget: processing pending delete\n");
-                if (!free_space(inode->sector, inode->length))
+                if (!free_space(inode->sector, inode->length)) {
                     inode->attr = (inode->attr & ~ATTR_DELPEND) | ATTR_DELETED;
+                    deletes_pending--;
+                }
             }
         }
     }
@@ -926,6 +929,9 @@ static int delete_file(struct adfs_dirent *child)
     struct adfs_inode *inode = inode_tab + child->inode;
     if (inode->attr & ATTR_DIR)
         return EISDIR;
+    if (fsmap[0x1fe] + deletes_pending + 1 >= FSMAP_MAX_ENT)
+        return ENOSPC;
+    deletes_pending++;
     inode->attr |= ATTR_DELPEND;
     return 0;
 }
@@ -944,6 +950,9 @@ static int delete_dir(struct adfs_dirent *child)
     read_dir(inode);
     if (inode->dir_contents->num_ent)
         return ENOTEMPTY;
+    if (fsmap[0x1fe] + deletes_pending + 1 >= FSMAP_MAX_ENT)
+        return ENOSPC;
+    deletes_pending++;
     inode->attr |= ATTR_DELPEND;
     return 0;
 }
@@ -996,7 +1005,12 @@ static void adfs_rename(fuse_req_t req, fuse_ino_t parent, const char *name, fus
                         default:
                             new_ent = find_name(npnode, new_bbc_name);
                             if (new_ent) {
+                                if (fsmap[0x1fe] + deletes_pending + 1 >= FSMAP_MAX_ENT) {
+                                    err = ENOSPC;
+                                    break;
+                                }
                                 inode_tab[new_ent->inode].attr |= ATTR_DELPEND;
+                                deletes_pending++;
                                 delete_name(npnode, new_ent);
                             }
                             if (!(err = insert_name(npnode, new_bbc_name, old_ent->inode)))
