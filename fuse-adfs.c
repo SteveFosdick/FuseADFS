@@ -1216,6 +1216,26 @@ static void adfs_flush(fuse_req_t req, fuse_ino_t ino, struct fuse_file_info *fi
     fuse_reply_err(req, ENOENT);
 }
 
+static void adfs_statfs(fuse_req_t req, fuse_ino_t ino)
+{
+    unsigned free_sects = 0;
+    int num_ent = fsmap[0x1fe];
+    for (int ent = 0; ent < num_ent; ent += 3)
+        free_sects += adfs_get24(fsmap + 0x100 + ent);
+    struct statvfs stbuf;
+    stbuf.f_bfree   = free_sects;
+    stbuf.f_bavail  = free_sects;
+    stbuf.f_bsize   = ADFS_SECT_SIZE;
+    stbuf.f_frsize  = ADFS_SECT_SIZE;
+    stbuf.f_blocks  = adfs_get24(fsmap+0xfc);
+    stbuf.f_files   = 0;
+    stbuf.f_ffree   = 0;
+    stbuf.f_favail  = 0;
+    stbuf.f_flag    = ST_NOATIME|ST_NODEV|ST_NODIRATIME|ST_NOEXEC|ST_NOSUID;
+    stbuf.f_namemax = ADFS_MAX_NAME;
+    fuse_reply_statfs(req, &stbuf);
+}
+
 static const struct fuse_lowlevel_ops adfs_ops =
 {
     .lookup  = adfs_lookup,
@@ -1231,7 +1251,8 @@ static const struct fuse_lowlevel_ops adfs_ops =
     .write   = adfs_write,
     .flush   = adfs_flush,
     .opendir = adfs_opendir,
-    .readdir = adfs_readdir
+    .readdir = adfs_readdir,
+    .statfs  = adfs_statfs
 };
 
 int main(int argc, char *argv[])
@@ -1269,7 +1290,7 @@ int main(int argc, char *argv[])
                         fl.l_pid = 0;
                         if (!fcntl(dev_fd, F_SETLKW, &fl)) {
                             if (!(ret = adfs_ioselect())) {
-                                if (options.read_only || !read_fsmap()) {
+                                if (!read_fsmap()) {
                                     uid = getuid();
                                     gid = getgid();
                                     if (!fuse_set_signal_handlers(se)) {
