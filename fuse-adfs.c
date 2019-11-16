@@ -85,6 +85,7 @@ static const struct fuse_opt option_spec[] = {
 static int dev_fd;
 static char *dev_name;
 static const char usage[] = "Usage: %s [options] -d <device|img-file> <mountpoint>\n";
+static const char xa_list[] = "user.acorn.loadaddr\0user.acorn.execaddr";
 static int (*readsect)(off_t posn, unsigned char *buf, size_t size);
 static int (*writesect)(off_t posn, const unsigned char *buf, size_t size);
 static uid_t uid;
@@ -1236,6 +1237,93 @@ static void adfs_statfs(fuse_req_t req, fuse_ino_t ino)
     fuse_reply_statfs(req, &stbuf);
 }
 
+static void adfs_setxattr(fuse_req_t req, fuse_ino_t ino, const char *name, const char *value, size_t size, int flags)
+{
+    int err = ENOENT;
+    if (--ino < itab_used) {
+        struct adfs_inode *inode = inode_tab + ino;
+        unsigned *addrp, found = 0;
+        if (!strcmp(name, xa_list)) {
+            addrp = &inode->load_addr;
+            found = 1;
+        }
+        else if (!strcmp(name, xa_list+20)) {
+            addrp = &inode->exec_addr;
+            found = 1;
+        }
+        if (found) {
+            char *end;
+            unsigned addr = strtoul(value, &end, 16);
+            if (end < (value + size))
+                err = EINVAL;
+            else {
+                *addrp = addr;
+                inode_tab[inode->parent].dir_contents->dirty = 1;
+                err = 0;
+            }
+        }
+    }
+    fuse_reply_err(req, err);
+}
+
+static void adfs_getxattr(fuse_req_t req, fuse_ino_t ino, const char *name, size_t size)
+{
+    int err = ENOENT;
+    if (--ino < itab_used) {
+        err = ENODATA;
+        if (!size) {
+            if (!strcmp(name, xa_list) || !strcmp(name, xa_list+20)) {
+                fuse_reply_xattr(req, 8);
+                return;
+            }
+        }
+        else {
+            unsigned addr, found = 0;
+            if (!strcmp(name, xa_list)) {
+                addr = inode_tab[ino].load_addr;
+                found = 1;
+            }
+            else if (!strcmp(name, xa_list+20)) {
+                addr = inode_tab[ino].exec_addr;
+                found = 1;
+            }
+            if (found) {
+                if (size >= 8) {
+                    char buf[9];
+                    fuse_reply_buf(req, buf, snprintf(buf, sizeof(buf), "%08X", addr));
+                    return;
+                }
+                else
+                    err = ERANGE;
+            }
+        }
+    }
+    fuse_reply_err(req, err);
+}
+
+static void adfs_listxattr(fuse_req_t req, fuse_ino_t ino, size_t size)
+{
+    int err = ENOENT;
+    if (--ino < itab_used) {
+        size_t len = (inode_tab[ino].attr & ATTR_DIR) ? 0 : sizeof(xa_list);
+        if (size == 0) {
+            fuse_reply_xattr(req, len);
+            return;
+        }
+        else if (inode_tab[ino].attr & ATTR_DIR) {
+            fuse_reply_buf(req, "", 0);
+            return;
+        }
+        else if (size >= sizeof(xa_list)) {
+            fuse_reply_buf(req, xa_list, len);
+            return;
+        }
+        else
+            err = ERANGE;
+    }
+    fuse_reply_err(req, err);
+}
+
 static const struct fuse_lowlevel_ops adfs_ops =
 {
     .lookup  = adfs_lookup,
@@ -1252,7 +1340,10 @@ static const struct fuse_lowlevel_ops adfs_ops =
     .flush   = adfs_flush,
     .opendir = adfs_opendir,
     .readdir = adfs_readdir,
-    .statfs  = adfs_statfs
+    .statfs  = adfs_statfs,
+    .setxattr  = adfs_setxattr,
+    .getxattr  = adfs_getxattr,
+    .listxattr = adfs_listxattr
 };
 
 int main(int argc, char *argv[])
