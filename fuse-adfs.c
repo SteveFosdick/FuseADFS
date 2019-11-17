@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <systemd/sd-journal.h>
 
 #define ADFS_SECT_SIZE  256
 #define ADFS_DIR_SECTS    5
@@ -1345,9 +1346,20 @@ static const struct fuse_lowlevel_ops adfs_ops =
     .getxattr  = adfs_getxattr,
     .listxattr = adfs_listxattr
 };
+static void custom_log(enum fuse_log_level level, const char *fmt, va_list ap)
+{
+    if (level < FUSE_LOG_DEBUG)
+        sd_journal_print(level, fmt, ap);
+    if (level < FUSE_LOG_DEBUG || options.foreground) {
+        fprintf(stderr, "%s: ", program_invocation_short_name);
+        vfprintf(stderr, fmt, ap);
+    }
+}
 
 int main(int argc, char *argv[])
 {
+    openlog(program_invocation_short_name, LOG_PERROR, LOG_USER);
+    fuse_set_log_func(custom_log);
     struct fuse_args args = FUSE_ARGS_INIT(argc, argv);
     int ret = 1;
 
@@ -1386,9 +1398,11 @@ int main(int argc, char *argv[])
                                     gid = getgid();
                                     if (!fuse_set_signal_handlers(se)) {
                                         if (!fuse_session_mount(se, mountpoint)) {
+                                            sd_journal_print(LOG_NOTICE, "mounted %s on %s", dev_name, mountpoint);
                                             fuse_daemonize(options.foreground);
                                             ret = fuse_session_loop(se);
                                             fuse_session_unmount(se);
+                                            sd_journal_print(LOG_NOTICE, "unmounted %s", mountpoint);
                                             write_dirty();
                                         }
                                         fuse_remove_signal_handlers(se);
@@ -1397,14 +1411,14 @@ int main(int argc, char *argv[])
                             }
                         }
                         else
-                            fuse_log(FUSE_LOG_ERR, "%s: unable to lock %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
+                            fuse_log(FUSE_LOG_ERR, "unable to lock %s: %s\n", dev_name, strerror(errno));
                     }
                     else
-                        fuse_log(FUSE_LOG_ERR, "%s: unable to allocate inode table: %s\n", program_invocation_short_name, strerror(errno));
+                        fuse_log(FUSE_LOG_ERR, "unable to allocate inode table: %s\n", strerror(errno));
                     close(dev_fd);
                 }
                 else
-                    fuse_log(FUSE_LOG_ERR, "%s: unable to open %s: %s\n", program_invocation_short_name, dev_name, strerror(errno));
+                    fuse_log(FUSE_LOG_ERR, "unable to open %s: %s\n", dev_name, strerror(errno));
                 fuse_session_destroy(se);
             }
         }
